@@ -42,6 +42,7 @@ struct ReaderView: View {
 
     @Environment(SettingsStore.self) private var settings
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.imagePipeline) private var images
 
     @State private var showChapterPicker = false
     /// The window hosting the reader, used to drive full screen.
@@ -62,6 +63,10 @@ struct ReaderView: View {
     /// Where along the progress bar a drag has reached, while it is being dragged.
     @State private var isScrubbing = false
     @State private var scrubFraction: CGFloat = 0
+    /// A page's width over its height, once one of them has loaded and can be measured.
+    @State private var pageAspect: CGFloat?
+    /// The shape last put on to the window, so it is only resized when it actually changes.
+    @State private var appliedAspectRatio: CGFloat = 0
     /// Distance from the window's top edge down to the traffic lights' centre line, so the
     /// control bar can put its own centre on the same line instead of guessing.
     @State private var trafficLightCentre: CGFloat?
@@ -104,6 +109,11 @@ struct ReaderView: View {
         // height of a title bar above the content, which reads as a bar across the top even
         // though no title is drawn in it.
         .ignoresSafeArea(.container, edges: .top)
+        // The window has an empty toolbar, which is what gives the traffic lights their
+        // ordinary spacing. In full screen macOS would otherwise draw it at the top of the
+        // display, and being empty it is just a blank strip of material — so it is kept out
+        // of the way there.
+        .windowToolbarFullScreenVisibility(.onHover)
         .onChange(of: controlsVisible) { _, _ in
             guard let window else { return }
             applyTrafficLightVisibility(in: window)
@@ -153,6 +163,19 @@ struct ReaderView: View {
             guard let newValue else { return }
             makeBorderless(newValue)
             restoreFullScreenPreference(in: newValue)
+            applyWindowShape(conforming: true)
+        }
+        .onChange(of: settings.layout) { _, _ in applyWindowShape(conforming: true) }
+        .onChange(of: settings.pageMode) { _, _ in applyWindowShape(conforming: true) }
+        .task(id: model.currentIndex) {
+            // A page's proportions are only knowable once its image has been loaded, so this
+            // looks again a few times before settling for the stand-in.
+            for attempt in 0..<4 {
+                await readPageAspect()
+                applyWindowShape()
+                if pageAspect != nil || attempt == 3 { return }
+                try? await Task.sleep(for: .seconds(1))
+            }
         }
         .task(id: window) {
             // Track full screen as it actually is, so leaving it with the green
@@ -163,8 +186,10 @@ struct ReaderView: View {
                 object: window
             ) {
                 settings.readerFullscreen = true
-                // Full screen has no traffic lights, so the controls stop clearing them.
+                // Full screen has no traffic lights, so the controls stop clearing them, and
+                // the page shape is released so the window can fill the display.
                 measureTrafficLights(in: window)
+                applyWindowShape()
             }
         }
         .task(id: window) {
@@ -175,6 +200,7 @@ struct ReaderView: View {
             ) {
                 settings.readerFullscreen = false
                 measureTrafficLights(in: window)
+                applyWindowShape()
             }
         }
         .onDisappear {
@@ -233,6 +259,68 @@ struct ReaderView: View {
         let closeFrame = close.convert(close.bounds, to: nil)
         trafficLightCentre = window.frame.height - closeFrame.midY
         trafficLightSpan = last.convert(last.bounds, to: nil).maxX + 10
+    }
+
+    /// The window's shape when two pages are read at a time: two of them side by side.
+    private var twoPageAspectRatio: CGFloat {
+        2 * (pageAspect ?? Self.typicalPageAspectRatio)
+    }
+
+    /// A page's width over its height, read from a page of the current spread that has
+    /// loaded. Proportions differ between series, so this is measured rather than assumed
+    /// wherever one is available.
+    private func readPageAspect() async {
+        let grid = spreads
+        guard grid.indices.contains(currentSpreadIndex) else {
+            pageAspect = nil
+            return
+        }
+
+        let maxPixelSize = model.renderMaxPixelSize
+        for page in grid[currentSpreadIndex] {
+            guard let image = await images.cachedImage(for: page.url, maxPixelSize: maxPixelSize),
+                  image.height > 0
+            else { continue }
+            pageAspect = CGFloat(image.width) / CGFloat(image.height)
+            return
+        }
+        pageAspect = nil
+    }
+
+    /// Stand-in proportions, used until a page has loaded.
+    private static let typicalPageAspectRatio: CGFloat = 2.0 / 3.0
+
+    /// Locks the window to the shape of the pages it is showing, so a two-page spread fills
+    /// it instead of being letterboxed inside it.
+    ///
+    /// Released whenever two pages are not being read at a time, and in full screen, where
+    /// an aspect ratio would fight the window filling the display.
+    ///
+    /// `conforming` also resizes the window to take the shape on. That is only safe once the
+    /// window is settled, so the full screen transitions never ask for it — resizing the
+    /// window while it is coming out of full screen hangs it.
+    private func applyWindowShape(conforming: Bool = false) {
+        guard let window else { return }
+        guard settings.layout == .horizontal,
+              settings.pageMode == .double,
+              !window.styleMask.contains(.fullScreen)
+        else {
+            appliedAspectRatio = 0
+            window.contentAspectRatio = .zero
+            return
+        }
+
+        let ratio = twoPageAspectRatio
+        window.contentAspectRatio = NSSize(width: ratio, height: 1)
+
+        // Take the shape on when it is first applied or whenever the pages' proportions turn
+        // out to be different, keeping the width.
+        guard conforming || ratio != appliedAspectRatio else { return }
+        appliedAspectRatio = ratio
+
+        let width = window.contentRect(forFrameRect: window.frame).width
+        guard width > 0 else { return }
+        window.setContentSize(NSSize(width: width, height: (width / ratio).rounded()))
     }
 
     /// The traffic lights go away with the rest of the controls, so a reader with the
