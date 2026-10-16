@@ -111,8 +111,9 @@ struct ReaderView: View {
         .ignoresSafeArea(.container, edges: .top)
         // The window has an empty toolbar, which is what gives the traffic lights their
         // ordinary spacing. In full screen macOS would otherwise draw it at the top of the
-        // display, and being empty it is just a blank strip of material — so it is kept out
-        // of the way there.
+        // display — and being empty, it is a blank strip of material. Asking for it on hover
+        // is as far as this can go: hiding the window toolbar outright changes the title bar
+        // itself, and doing that around a full screen transition is what hangs the window.
         .windowToolbarFullScreenVisibility(.onHover)
         .onChange(of: controlsVisible) { _, _ in
             guard let window else { return }
@@ -163,10 +164,10 @@ struct ReaderView: View {
             guard let newValue else { return }
             makeBorderless(newValue)
             restoreFullScreenPreference(in: newValue)
-            applyWindowShape(conforming: true)
+            applyWindowShape(resizing: true)
         }
-        .onChange(of: settings.layout) { _, _ in applyWindowShape(conforming: true) }
-        .onChange(of: settings.pageMode) { _, _ in applyWindowShape(conforming: true) }
+        .onChange(of: settings.layout) { _, _ in applyWindowShape(resizing: true) }
+        .onChange(of: settings.pageMode) { _, _ in applyWindowShape(resizing: true) }
         .task(id: model.currentIndex) {
             // A page's proportions are only knowable once its image has been loaded, so this
             // looks again a few times before settling for the stand-in.
@@ -186,10 +187,15 @@ struct ReaderView: View {
                 object: window
             ) {
                 settings.readerFullscreen = true
-                // Full screen has no traffic lights, so the controls stop clearing them, and
-                // the page shape is released so the window can fill the display.
-                measureTrafficLights(in: window)
-                applyWindowShape()
+                // Nothing touches the window here. It is in the middle of AppKit's full
+                // screen transition, and mutating the window in that state is what hung it.
+                // The work waits until the transition has settled.
+                let window = window
+                Task {
+                    try? await Task.sleep(for: .seconds(1))
+                    guard window.styleMask.contains(.fullScreen) else { return }
+                    applyWindowShape()
+                }
             }
         }
         .task(id: window) {
@@ -199,8 +205,15 @@ struct ReaderView: View {
                 object: window
             ) {
                 settings.readerFullscreen = false
-                measureTrafficLights(in: window)
-                applyWindowShape()
+                // Same again: the window is still settling back, so the measuring and the
+                // shape wait for it.
+                let window = window
+                Task {
+                    try? await Task.sleep(for: .seconds(1))
+                    guard !window.styleMask.contains(.fullScreen) else { return }
+                    measureTrafficLights(in: window)
+                    applyWindowShape()
+                }
             }
         }
         .onDisappear {
@@ -243,21 +256,25 @@ struct ReaderView: View {
 
     /// Records where the traffic lights sit, so the control bar can clear them and put its
     /// own centre line on theirs.
+    ///
+    /// The room they take is measured in full screen as well: macOS reveals the window's
+    /// toolbar — and the lights with it — when the pointer goes to the top of the display,
+    /// and the controls need to have moved over by then.
     private func measureTrafficLights(in window: NSWindow) {
         let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
             .compactMap { window.standardWindowButton($0) }
 
-        guard !window.styleMask.contains(.fullScreen),
-              let close = buttons.first,
-              let last = buttons.last
-        else {
+        guard let close = buttons.first, let last = buttons.last else {
             trafficLightCentre = nil
             trafficLightSpan = 0
             return
         }
 
-        let closeFrame = close.convert(close.bounds, to: nil)
-        trafficLightCentre = window.frame.height - closeFrame.midY
+        // Full screen has no title bar of its own, so there is no centre line to line up
+        // with and the controls fall back to their own inset.
+        trafficLightCentre = window.styleMask.contains(.fullScreen)
+            ? nil
+            : window.frame.height - close.convert(close.bounds, to: nil).midY
         trafficLightSpan = last.convert(last.bounds, to: nil).maxX + 10
     }
 
@@ -296,10 +313,11 @@ struct ReaderView: View {
     /// Released whenever two pages are not being read at a time, and in full screen, where
     /// an aspect ratio would fight the window filling the display.
     ///
-    /// `conforming` also resizes the window to take the shape on. That is only safe once the
+    /// `resizing` also resizes the window to take the shape on. That is only safe once the
     /// window is settled, so the full screen transitions never ask for it — resizing the
-    /// window while it is coming out of full screen hangs it.
-    private func applyWindowShape(conforming: Bool = false) {
+    /// window while it is coming out of full screen hangs it, and a ratio that changed while
+    /// it was away is not a reason to do it then.
+    private func applyWindowShape(resizing: Bool = false) {
         guard let window else { return }
         guard settings.layout == .horizontal,
               settings.pageMode == .double,
@@ -315,7 +333,7 @@ struct ReaderView: View {
 
         // Take the shape on when it is first applied or whenever the pages' proportions turn
         // out to be different, keeping the width.
-        guard conforming || ratio != appliedAspectRatio else { return }
+        guard resizing, ratio != appliedAspectRatio else { return }
         appliedAspectRatio = ratio
 
         let width = window.contentRect(forFrameRect: window.frame).width
