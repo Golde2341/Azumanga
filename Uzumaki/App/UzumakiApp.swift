@@ -33,6 +33,14 @@ struct UzumakiApp: App {
             }
         }
         .defaultSize(width: 1100, height: 850)
+        // The page is the window: no title bar taking a strip of its own, so the reader's
+        // floating controls can come and go without the page moving. The window still has
+        // its traffic lights and can still be dragged by the top edge.
+        .windowStyle(.hiddenTitleBar)
+        // Reading is a session, not a document: reopening it at launch would drop the
+        // reader back into whichever chapter was last open, which is not where anyone
+        // wants to start. Opening a chapter is always an explicit act.
+        .restorationBehavior(.disabled)
         .modelContainer(app.services.container)
     }
 }

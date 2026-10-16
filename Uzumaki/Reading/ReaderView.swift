@@ -47,8 +47,29 @@ struct ReaderView: View {
     /// The window hosting the reader, used to drive full screen.
     @State private var window: NSWindow?
     /// The spread on screen, as the id of its first page. Two-way bound to the scroll
-    /// view, so gestures report where they landed and keyboards can drive it back.
-    @State private var scrollPosition: Int?
+    /// view, so a gesture reports where it landed and a keyboard turn can drive it back.
+    @State private var spreadPosition: Int?
+    /// The scroll view's live offset, which the paging behavior reads when a gesture ends.
+    @State private var scrollOffset = ReaderScrollOffset()
+    /// Whether the reader's own controls are on screen. They stay out of the way while
+    /// reading and come back when the pointer arrives or the page is clicked.
+    @State private var controlsVisible = true
+    /// Bumped every time the controls are called for. Drives the countdown that puts them
+    /// away again, so SwiftUI owns the timing rather than a task held in state.
+    @State private var revealTick = 0
+    /// Whether the display popover is open.
+    @State private var showsDisplayOptions = false
+    /// Where along the progress bar a drag has reached, while it is being dragged.
+    @State private var isScrubbing = false
+    @State private var scrubFraction: CGFloat = 0
+    /// Distance from the window's top edge down to the traffic lights' centre line, so the
+    /// control bar can put its own centre on the same line instead of guessing.
+    @State private var trafficLightCentre: CGFloat?
+    /// How much room the traffic lights take up along the top, so the controls clear them.
+    /// Zero in full screen, where there are none.
+    @State private var trafficLightSpan: CGFloat = 64
+    /// The control bar's own height, measured for that same calculation.
+    @State private var controlBarHeight: CGFloat = 0
 
     var body: some View {
         ZStack {
@@ -56,17 +77,57 @@ struct ReaderView: View {
                 .ignoresSafeArea()
 
             content
+                // A click on the page also brings the controls back, for when the pointer
+                // has not moved to do it.
+                .simultaneousGesture(TapGesture().onEnded { revealControls() })
 
             if model.isLoading {
                 ProgressView()
                     .controlSize(.large)
             }
 
-            pageIndicator
+            if controlsVisible {
+                VStack {
+                    controlBar
+                    Spacer()
+                }
+                .transition(.opacity)
+            }
+
+            if controlsVisible {
+                pageIndicator
+                    .transition(.opacity)
+            }
         }
+        .animation(.easeInOut(duration: 0.18), value: controlsVisible)
+        // The page runs to the very top edge. Without this the window keeps a strip the
+        // height of a title bar above the content, which reads as a bar across the top even
+        // though no title is drawn in it.
+        .ignoresSafeArea(.container, edges: .top)
+        .onChange(of: controlsVisible) { _, _ in
+            guard let window else { return }
+            applyTrafficLightVisibility(in: window)
+        }
+        .onHover { isInside in
+            // Only the pointer arriving counts. Movement inside the reader deliberately
+            // does not push the clock back — otherwise a moving mouse would hold the
+            // controls on screen forever and they would never go away. Clicking, or
+            // leaving and coming back, calls for them again.
+            if isInside {
+                revealControls()
+            }
+        }
+        .task(id: revealTick) {
+            guard revealTick > 0 else { return }
+            try? await Task.sleep(for: .seconds(3))
+            // Never while something presented is open: the display popover and the chapter
+            // sheet are anchored to controls, and hiding those would take them along.
+            guard !Task.isCancelled, !showsDisplayOptions, !showChapterPicker else { return }
+            controlsVisible = false
+        }
+        .onAppear { revealControls() }
         .background(WindowAccessor(window: $window))
         .navigationTitle(model.chapterLabel)
-        .toolbar { toolbar }
         .focusable()
         .focusEffectDisabled()
         .onKeyPress(.leftArrow) { turnSpread(-1); return .handled }
@@ -90,6 +151,7 @@ struct ReaderView: View {
         }
         .onChange(of: window) { _, newValue in
             guard let newValue else { return }
+            makeBorderless(newValue)
             restoreFullScreenPreference(in: newValue)
         }
         .task(id: window) {
@@ -101,6 +163,8 @@ struct ReaderView: View {
                 object: window
             ) {
                 settings.readerFullscreen = true
+                // Full screen has no traffic lights, so the controls stop clearing them.
+                measureTrafficLights(in: window)
             }
         }
         .task(id: window) {
@@ -110,10 +174,73 @@ struct ReaderView: View {
                 object: window
             ) {
                 settings.readerFullscreen = false
+                measureTrafficLights(in: window)
             }
         }
         .onDisappear {
             model.flushProgress()
+        }
+    }
+
+    /// Shows the controls and restarts the countdown that puts them away again.
+    private func revealControls() {
+        controlsVisible = true
+        revealTick += 1
+    }
+
+    /// Makes the reader window borderless: no title bar of its own, and the page drawn from
+    /// the very top edge with the traffic lights floating over it.
+    ///
+    /// `.windowStyle(.hiddenTitleBar)` hides the title but still reserves the title bar's
+    /// height, which is what left a bar across the top of the window. `fullSizeContentView`
+    /// is what lets the content into that space.
+    private func makeBorderless(_ window: NSWindow) {
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.styleMask.insert(.fullSizeContentView)
+        window.titlebarSeparatorStyle = .none
+
+        // An empty toolbar is the root of the traffic lights' spacing. macOS lays them out
+        // the way it does for an ordinary window when a toolbar is present, and tucks them
+        // into the corner when the window has only a bare title bar. None of it is drawn —
+        // the title bar is transparent and the page runs the full height of the window —
+        // and because the system owns the layout, resizing leaves the lights where they are
+        // with nothing to re-apply.
+        if window.toolbar == nil {
+            window.toolbarStyle = .unified
+            window.toolbar = NSToolbar(identifier: "UzumakiReaderToolbar")
+        }
+
+        applyTrafficLightVisibility(in: window)
+        measureTrafficLights(in: window)
+    }
+
+    /// Records where the traffic lights sit, so the control bar can clear them and put its
+    /// own centre line on theirs.
+    private func measureTrafficLights(in window: NSWindow) {
+        let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
+            .compactMap { window.standardWindowButton($0) }
+
+        guard !window.styleMask.contains(.fullScreen),
+              let close = buttons.first,
+              let last = buttons.last
+        else {
+            trafficLightCentre = nil
+            trafficLightSpan = 0
+            return
+        }
+
+        let closeFrame = close.convert(close.bounds, to: nil)
+        trafficLightCentre = window.frame.height - closeFrame.midY
+        trafficLightSpan = last.convert(last.bounds, to: nil).maxX + 10
+    }
+
+    /// The traffic lights go away with the rest of the controls, so a reader with the
+    /// controls put away has nothing on screen but the page. Hidden rather than faded, so
+    /// they cannot be clicked while they cannot be seen.
+    private func applyTrafficLightVisibility(in window: NSWindow) {
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(type)?.isHidden = !controlsVisible
         }
     }
 
@@ -190,14 +317,14 @@ struct ReaderView: View {
         }
     }
 
-    /// Horizontal paging is the platform's scroll view, with one custom decision about
-    /// where a gesture is allowed to rest.
+    /// Horizontal paging is the platform's scroll view with one custom decision about
+    /// where a gesture comes to rest.
     ///
-    /// Every spread is one viewport wide, so the scroll view's own follow-the-finger
-    /// motion, rubber band and deceleration all apply as they are. `ReaderPagingBehavior`
-    /// replaces the default `.paging` snap: a gesture settles on one page at most, and it
-    /// needs less distance the faster it was, so a flick turns the page without having to
-    /// be dragged across the screen first.
+    /// Every spread is a page in a scrolling row, so the pages track the fingers the way
+    /// the desktop swipe does — across as many of them as the gesture covers.
+    /// `ReaderPagingBehavior` then settles on whichever page the fingers were nearest to
+    /// rather than following the momentum, so a fast swipe lands where it was aimed
+    /// instead of sailing past pages that were never read.
     private var horizontalReader: some View {
         GeometryReader { geometry in
             let size = geometry.size
@@ -211,8 +338,8 @@ struct ReaderView: View {
                 }
                 .scrollTargetLayout()
             }
-            .scrollTargetBehavior(ReaderPagingBehavior(pageWidth: size.width))
-            .scrollPosition(id: $scrollPosition, anchor: .center)
+            .scrollTargetBehavior(ReaderPagingBehavior(pageWidth: size.width, offset: scrollOffset))
+            .scrollPosition(id: $spreadPosition, anchor: .center)
             .scrollIndicators(.never)
             // A zoomed page needs the drag to pan it rather than to turn the page.
             .scrollDisabled(model.zoom > 1)
@@ -222,16 +349,30 @@ struct ReaderView: View {
             .onTapGesture(count: 2) {
                 model.zoom > 1 ? model.resetZoom() : model.setZoom(2)
             }
-            .onAppear { scrollPosition = scrollTargetID }
-            .onChange(of: scrollPosition) { _, newValue in
-                guard let newValue, newValue != scrollTargetID else { return }
+            // Where the fingers let go is only knowable here, so it is passed to the
+            // behavior rather than left to the momentum the scroll view would project.
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                geometry.contentOffset.x
+            } action: { _, offset in
+                scrollOffset.value = offset
+            }
+            .onAppear { spreadPosition = spreadID(at: currentSpreadIndex) }
+            .onChange(of: spreadPosition) { _, newValue in
+                guard let newValue, newValue != spreadID(at: currentSpreadIndex) else { return }
                 model.goToPage(newValue)
             }
             .onChange(of: model.currentIndex) { _, _ in
-                guard scrollTargetID != scrollPosition else { return }
-                withAnimation(ReaderView.pageTurnAnimation) { scrollPosition = scrollTargetID }
+                guard spreadID(at: currentSpreadIndex) != spreadPosition else { return }
+                withAnimation(ReaderView.pageTurnAnimation) { spreadPosition = spreadID(at: currentSpreadIndex) }
             }
         }
+    }
+
+    /// Identity the scroll view is addressed by: the first page of a spread.
+    private func spreadID(at index: Int) -> Int? {
+        let grid = spreads
+        guard grid.indices.contains(index) else { return nil }
+        return grid[index].first?.index
     }
 
     /// Deliberate page turn: one spread, which is one page in single-page mode and a
@@ -242,17 +383,17 @@ struct ReaderView: View {
             return
         }
 
-        let grid = spreads
+        // A reading-order step, which right to left reverses.
         let step = settings.direction == .rightToLeft ? -direction : direction
-        let next = ReaderSpreads.step(from: currentSpreadIndex, by: step, count: grid.count)
-
-        guard next != currentSpreadIndex, let firstPage = grid[next].first else {
+        let neighbour = currentSpreadIndex + step
+        guard spreads.indices.contains(neighbour), let firstPage = spreads[neighbour].first else {
             // At the end of the chapter, keep the existing behaviour of moving on.
             direction > 0 ? model.nextPage() : model.previousPage()
             return
         }
+
         withAnimation(ReaderView.pageTurnAnimation) {
-            scrollPosition = firstPage.index
+            spreadPosition = firstPage.index
         }
     }
 
@@ -262,13 +403,6 @@ struct ReaderView: View {
     /// spread starting at it, so fall back to the spread that contains it.
     private var currentSpreadIndex: Int {
         ReaderSpreads.spreadIndex(showing: model.currentIndex, in: spreads) ?? 0
-    }
-
-    /// Identity of the spread being read, used to address the scroll view.
-    private var scrollTargetID: Int? {
-        let grid = spreads
-        guard grid.indices.contains(currentSpreadIndex) else { return nil }
-        return grid[currentSpreadIndex].first?.index
     }
 
     @ViewBuilder
@@ -327,8 +461,14 @@ struct ReaderView: View {
                     .disabled(!model.hasPreviousChapter)
                     .buttonStyle(.plain)
 
-                    Text("\(model.currentIndex + 1) / \(model.pages.count)")
-                        .font(.caption.monospacedDigit())
+                    VStack(spacing: 4) {
+                        Text("\(scrubPage + 1) / \(model.pages.count)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+
+                        progressBar
+                    }
+                    .frame(width: 260)
 
                     Button {
                         Task { await model.goToChapter(index: model.currentChapterIndex + 1) }
@@ -347,99 +487,290 @@ struct ReaderView: View {
         .allowsHitTesting(!model.pages.isEmpty)
     }
 
-    // MARK: - Toolbar
+    /// The page the bar is reporting: the one a drag has reached, or the one being read.
+    private var scrubPage: Int {
+        guard isScrubbing else { return model.currentIndex }
+        return ReaderScrubbing.page(atFraction: scrubFraction, pageCount: model.pages.count)
+    }
 
-    @ToolbarContentBuilder
-    private var toolbar: some ToolbarContent {
-        // `.cancellationAction` rather than `.navigation`: the reader is its own
-        // window now, and navigation placement only renders inside a stack.
-        ToolbarItem(placement: .cancellationAction) {
-            Button {
-                model.flushProgress()
-                dismiss()
-            } label: {
-                Label("Close", systemImage: "xmark")
+    /// Progress through the chapter, draggable to jump. The page itself is only changed
+    /// when the drag ends — scrubbing across a long chapter would otherwise ask for every
+    /// page it passes over.
+    private var progressBar: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            let fraction = ReaderScrubbing.fraction(ofPage: scrubPage, pageCount: model.pages.count)
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.quaternary)
+                    .frame(height: 4)
+                Capsule()
+                    .fill(.tint)
+                    .frame(width: width * fraction, height: 4)
+                Circle()
+                    .fill(.tint)
+                    .frame(width: 10, height: 10)
+                    .offset(x: min(max(0, width * fraction - 5), max(0, width - 10)))
             }
-            .keyboardShortcut(.escape, modifiers: [])
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        guard width > 0 else { return }
+                        isScrubbing = true
+                        scrubFraction = min(max(0, value.location.x / width), 1)
+                    }
+                    .onEnded { _ in
+                        let target = ReaderScrubbing.page(
+                            atFraction: scrubFraction,
+                            pageCount: model.pages.count
+                        )
+                        isScrubbing = false
+                        model.goToPage(target)
+                    }
+            )
         }
+        .frame(height: 12)
+        .help("Drag to jump to a page")
+    }
 
-        ToolbarItem(placement: .principal) {
-            VStack(spacing: 1) {
-                Text(model.chapterLabel)
-                    .font(.headline)
-                    .lineLimit(1)
-                Text(model.manga.title)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+    // MARK: - Controls
+
+    /// The reader's controls, sitting in a bar across the top of the page.
+    ///
+    /// An overlay rather than the window's toolbar. A title bar occupies a strip of its
+    /// own, so hiding and showing it pushed the page up and down underneath it; drawn over
+    /// the page means the controls can come and go without the reading position moving.
+    ///
+    /// The bar spans the window and the traffic lights sit in it, with the controls
+    /// gathered into rounded groups beside them.
+    private var controlBar: some View {
+        GlassEffectContainer(spacing: 12) {
+            HStack(spacing: 12) {
+                glassGroup {
+                    closeControl
+                    Divider()
+                        .frame(height: 20)
+                    chapterControls
+                }
+                // The clearance for the traffic lights is applied inside this group's frame
+                // rather than around the whole row, so both ends stay the same width and the
+                // title stays centred on the window.
+                .padding(.leading, trafficLightSpan)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                titleControl
+
+                glassGroup {
+                    bookmarkControl
+                    displayControl
+                    fullScreenControl
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
             }
-            .frame(minWidth: 160)
         }
+        .padding(.horizontal, 12)
+        .padding(.top, controlBarTopPadding)
+        .onGeometryChange(for: CGFloat.self) { bar in
+            bar.size.height
+        } action: { height in
+            controlBarHeight = height
+        }
+    }
 
-        ToolbarItemGroup(placement: .automatic) {
-            Button {
-                Task { await model.goToChapter(index: model.currentChapterIndex - 1) }
-            } label: {
-                Label("Previous Chapter", systemImage: "chevron.left")
+    /// Puts the control bar's centre line on the traffic lights' centre line, so the lights
+    /// read as part of the bar rather than floating above it.
+    private var controlBarTopPadding: CGFloat {
+        guard let centre = trafficLightCentre, controlBarHeight > 0 else { return 8 }
+        return max(0, centre - controlBarHeight / 2)
+    }
+
+    /// Puts a run of controls on one piece of glass, the way a toolbar groups them.
+    private func glassGroup<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: 10) {
+            content()
+        }
+        .font(.system(size: 18))
+        .labelStyle(.iconOnly)
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 6)
+        .glassEffect()
+    }
+
+    private var closeControl: some View {
+        Button {
+            model.flushProgress()
+            dismiss()
+        } label: {
+            Label("Close", systemImage: "xmark")
+        }
+        .keyboardShortcut(.escape, modifiers: [])
+        .help("Close")
+    }
+
+    @ViewBuilder
+    private var chapterControls: some View {
+        Button {
+            Task { await model.goToChapter(index: model.currentChapterIndex - 1) }
+        } label: {
+            Label("Previous Chapter", systemImage: "chevron.left")
+        }
+        .disabled(!model.hasPreviousChapter)
+        .help("Previous chapter")
+
+        Button {
+            showChapterPicker = true
+        } label: {
+            Label("Chapters", systemImage: "list.bullet")
+        }
+        .help("Chapters")
+
+        Button {
+            Task { await model.goToChapter(index: model.currentChapterIndex + 1) }
+        } label: {
+            Label("Next Chapter", systemImage: "chevron.right")
+        }
+        .disabled(!model.hasNextChapter)
+        .help("Next chapter")
+    }
+
+    private var titleControl: some View {
+        VStack(spacing: 0) {
+            Text(model.chapterLabel)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+            Text(model.manga.title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .glassEffect()
+    }
+
+    private var bookmarkControl: some View {
+        Button {
+            model.toggleBookmark()
+        } label: {
+            Label(
+                model.isCurrentPageBookmarked ? "Remove Bookmark" : "Bookmark Page",
+                systemImage: model.isCurrentPageBookmarked ? "bookmark.fill" : "bookmark"
+            )
+        }
+        .disabled(model.pages.isEmpty)
+        .help("Bookmark this page")
+    }
+
+    private var displayControl: some View {
+        Button {
+            showsDisplayOptions = true
+        } label: {
+            Label("Display", systemImage: "slider.horizontal.3")
+        }
+        .popover(isPresented: $showsDisplayOptions, arrowEdge: .top) {
+            displayOptions
+        }
+        .help("Reading options")
+    }
+
+    private var fullScreenControl: some View {
+        Button {
+            toggleFullScreen()
+        } label: {
+            Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
+        }
+        .help("Full screen")
+    }
+
+    // MARK: - Display options
+
+    /// The reader's settings, with the viewing presets at the top.
+    ///
+    /// A popover rather than a menu: a menu renders one row per item and flattens anything
+    /// that is not a menu item, so the presets could only ever have been plain rows. Here
+    /// they are buttons that look like buttons.
+    private var displayOptions: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                ForEach(ReaderPreset.allCases) { preset in
+                    presetButton(preset)
+                }
             }
-            .disabled(!model.hasPreviousChapter)
 
-            Button {
-                showChapterPicker = true
-            } label: {
-                Label("Chapters", systemImage: "list.bullet")
-            }
+            Divider()
 
-            Button {
-                Task { await model.goToChapter(index: model.currentChapterIndex + 1) }
-            } label: {
-                Label("Next Chapter", systemImage: "chevron.right")
-            }
-            .disabled(!model.hasNextChapter)
-
-            Button {
-                model.toggleBookmark()
-            } label: {
-                Label(
-                    model.isCurrentPageBookmarked ? "Remove Bookmark" : "Bookmark Page",
-                    systemImage: model.isCurrentPageBookmarked ? "bookmark.fill" : "bookmark"
-                )
-            }
-            .disabled(model.pages.isEmpty)
-
-            Menu {
-                Picker("Layout", selection: Binding(get: { settings.layout }, set: { settings.layout = $0 })) {
+            LabeledContent("Layout") {
+                Picker("Layout", selection: binding(get: { $0.layout }, set: { $0.layout = $1 })) {
                     ForEach(ReaderLayoutKind.allCases) { Text($0.displayName).tag($0) }
                 }
-                Picker("Direction", selection: Binding(get: { settings.direction }, set: { settings.direction = $0 })) {
+                .labelsHidden()
+            }
+            LabeledContent("Direction") {
+                Picker("Direction", selection: binding(get: { $0.direction }, set: { $0.direction = $1 })) {
                     ForEach(ReadingDirection.allCases) { Text($0.displayName).tag($0) }
                 }
-                Picker("Pages", selection: Binding(get: { settings.pageMode }, set: { settings.pageMode = $0 })) {
+                .labelsHidden()
+            }
+            LabeledContent("Pages") {
+                Picker("Pages", selection: binding(get: { $0.pageMode }, set: { $0.pageMode = $1 })) {
                     ForEach(PageMode.allCases) { Text($0.displayName).tag($0) }
                 }
-                Picker("Fit", selection: Binding(get: { settings.fitMode }, set: { settings.fitMode = $0 })) {
+                .labelsHidden()
+            }
+            LabeledContent("Fit") {
+                Picker("Fit", selection: binding(get: { $0.fitMode }, set: { $0.fitMode = $1 })) {
                     ForEach(PageFitMode.allCases) { Text($0.displayName).tag($0) }
                 }
-                Divider()
+                .labelsHidden()
+            }
+
+            Divider()
+
+            HStack(spacing: 8) {
                 Button("Zoom In") { model.zoomIn() }
                 Button("Zoom Out") { model.zoomOut() }
                 Button("Actual Fit") { model.resetZoom() }
-                Divider()
-                Toggle("Mark Chapter as Read", isOn: Binding(
-                    get: { false },
-                    set: { if $0 { model.markCurrentChapterRead() } }
-                ))
-                Button("Mark Chapter as Unread") { model.markCurrentChapterUnread() }
-            } label: {
-                Label("Display", systemImage: "slider.horizontal.3")
             }
+            .controlSize(.small)
 
-            Button {
-                toggleFullScreen()
-            } label: {
-                Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
+            Divider()
+
+            HStack(spacing: 8) {
+                Button("Mark Chapter Read") { model.markCurrentChapterRead() }
+                Button("Mark Unread") { model.markCurrentChapterUnread() }
             }
+            .controlSize(.small)
         }
+        .padding(14)
+        .frame(width: 300)
+    }
+
+    /// A preset as a pill, filled in when the reader is already set up that way.
+    private func presetButton(_ preset: ReaderPreset) -> some View {
+        let isCurrent = settings.layout == preset.layout && settings.pageMode == preset.pageMode
+        return Button {
+            settings.layout = preset.layout
+            settings.pageMode = preset.pageMode
+        } label: {
+            Text(preset.displayName)
+                .font(.subheadline.weight(.medium))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(isCurrent ? AnyShapeStyle(.tint) : AnyShapeStyle(.quaternary), in: Capsule())
+                .foregroundStyle(isCurrent ? Color.white : Color.primary)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func binding<Value>(
+        get: @escaping (SettingsStore) -> Value,
+        set: @escaping (SettingsStore, Value) -> Void
+    ) -> Binding<Value> {
+        Binding(get: { get(settings) }, set: { set(settings, $0) })
     }
 
     private func toggleFullScreen() {

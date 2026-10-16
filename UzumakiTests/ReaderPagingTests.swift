@@ -2,106 +2,103 @@ import Foundation
 import Testing
 @testable import Uzumaki
 
-@Suite("Reader scroll limiting")
+@Suite("Reader scroll settling")
 struct ReaderPagingTests {
     private let width: CGFloat = 800
 
-    /// A speed at which distance no longer matters, and one where it half does.
-    private let fullSpeed = ReaderPaging.fullSpeedVelocity
-    private let halfSpeed = ReaderPaging.fullSpeedVelocity / 2
+    private let flick = ReaderPaging.fullSpeedVelocity * 2
 
-    /// Distance a *slow* drag has to cover to turn. Derived from the constant rather than
-    /// hardcoded, so the tests express the policy and not the current numbers.
-    private var slowTurnDistance: CGFloat { width * ReaderPaging.turnThreshold }
-
-    private func settle(origin: CGFloat = 0, proposed: CGFloat, velocity: CGFloat) -> CGFloat {
-        ReaderPaging.settleTarget(origin: origin, proposed: proposed, pageWidth: width, velocity: velocity)
+    /// A slow drag: the fingers moved the page and stopped.
+    private func dragged(from origin: CGFloat = 0, to position: CGFloat) -> CGFloat {
+        settle(origin: origin, position: position, velocity: 0)
     }
 
-    @Test("A slow drag short of the turn distance springs back")
-    func slowDragSpringsBack() {
-        for travel in [0, 40, -20, slowTurnDistance - 1, -(slowTurnDistance - 1)] as [CGFloat] {
-            #expect(settle(proposed: travel, velocity: 0) == 0)
+    /// A flick: a quick gesture, which is its own decision regardless of distance.
+    private func flicked(from origin: CGFloat = 0, to position: CGFloat) -> CGFloat {
+        settle(origin: origin, position: position, velocity: flick)
+    }
+
+    private func settle(origin: CGFloat, position: CGFloat, velocity: CGFloat) -> CGFloat {
+        ReaderPaging.settleTarget(
+            origin: origin,
+            position: position,
+            pageWidth: width,
+            velocity: velocity
+        )
+    }
+
+    @Test("A drag that stops short of half a page springs back")
+    func shortDragSpringsBack() {
+        for position in [0, 40, width * 0.2, width * 0.49, -width * 0.3] as [CGFloat] {
+            #expect(dragged(to: position) == 0)
         }
     }
 
-    @Test("A slow drag past the turn distance turns exactly one page")
-    func slowDragTurnsOnePage() {
-        #expect(settle(proposed: slowTurnDistance + 1, velocity: 0) == width)
-        #expect(settle(proposed: -(slowTurnDistance + 1), velocity: 0) == -width)
+    @Test("A drag past half a page turns")
+    func dragPastHalfTurns() {
+        #expect(dragged(to: width * 0.5) == width)
+        #expect(dragged(to: width * 0.9) == width)
+        #expect(dragged(to: -width * 0.6) == -width)
     }
 
-    @Test("Scrolling fast turns the page well before it has crossed the screen")
-    func speedShortensTheDistanceNeeded() {
-        // A tenth of the screen: nowhere near half, and not far enough for a slow drag.
-        let travel = width * 0.1
-        #expect(travel < slowTurnDistance)
-        #expect(settle(proposed: travel, velocity: 0) == 0)
-        #expect(settle(proposed: travel, velocity: halfSpeed) == width)
+    @Test("A long swipe crosses as many pages as it covers")
+    func longSwipeCrossesManyPages() {
+        // The whole point of following the fingers: no cap at one page per gesture.
+        #expect(dragged(to: width * 2.4) == width * 2)
+        #expect(dragged(to: width * 5.6) == width * 6)
+        #expect(dragged(to: -width * 3.7) == -width * 4)
     }
 
-    @Test("The faster the gesture, the less distance it needs")
-    func requiredDistanceFallsWithSpeed() {
-        let travel: CGFloat = 140
-        var turned: [Bool] = []
-        for velocity in [0, 250, halfSpeed, fullSpeed] as [CGFloat] {
-            turned.append(settle(proposed: travel, velocity: velocity) == width)
-        }
-        // Slow to fast: once speed is enough, more speed never takes the turn away.
-        #expect(turned == [false, true, true, true])
+    @Test("A flick turns the page without having to cross half of it")
+    func flickTurnsFromShortOfHalf() {
+        #expect(flicked(to: width * 0.05) == width)
+        #expect(flicked(to: -width * 0.05) == -width)
     }
 
-    @Test("At full speed any deliberate push turns the page")
-    func fullSpeedTurnsOnAnyTravel() {
-        let push = ReaderPaging.minimumTravel + 1
-        #expect(settle(proposed: push, velocity: fullSpeed) == width)
-        #expect(settle(proposed: -push, velocity: fullSpeed) == -width)
-        #expect(settle(proposed: push, velocity: fullSpeed * 4) == width)
-    }
-
-    @Test("A gesture that is fast but goes nowhere does not turn")
-    func fastButGoingNowhereDoesNotTurn() {
-        #expect(settle(proposed: 0, velocity: fullSpeed * 4) == 0)
-        #expect(settle(proposed: ReaderPaging.minimumTravel - 1, velocity: fullSpeed * 4) == 0)
-    }
-
-    @Test("No proposal can carry a gesture past the neighbouring page")
-    func travelIsCappedAtOnePage() {
-        for proposed in [width * 2, width * 10, width * 1_000] as [CGFloat] {
-            #expect(settle(proposed: proposed, velocity: fullSpeed) == width)
-        }
-        for proposed in [-width * 2, -width * 1_000] as [CGFloat] {
-            #expect(settle(proposed: proposed, velocity: fullSpeed) == -width)
+    @Test("Speed does not carry a gesture past where its fingers went")
+    func speedDoesNotStandInForDistance() {
+        // Momentum is deliberately not consulted, so throwing harder does not land the
+        // reader pages further on than the fingers reached.
+        let barelyMoved = width * 0.05
+        for velocity in [flick, flick * 10, flick * 100] as [CGFloat] {
+            #expect(settle(origin: 0, position: barelyMoved, velocity: velocity) == width)
         }
     }
 
-    @Test("Resting places are always on the page grid")
-    func settlesOnTheGrid() {
-        let origin = width * 3
-        #expect(settle(origin: origin, proposed: origin + 10, velocity: 0) == origin)
-        #expect(settle(origin: origin, proposed: origin + slowTurnDistance + 1, velocity: 0) == origin + width)
-        #expect(settle(origin: origin, proposed: origin - slowTurnDistance - 1, velocity: 0) == origin - width)
+    @Test("A flick on a long swipe does not overshoot the nearest page")
+    func flickOnALongSwipeLandsNearest() {
+        #expect(flicked(to: width * 3.2) == width * 3)
+        #expect(flicked(to: width * 4.1) == width * 4)
     }
 
-    @Test("An origin left off the grid by a resize is snapped back on to it")
-    func offGridOriginIsSnapped() {
-        #expect(settle(origin: 37, proposed: 40, velocity: 0) == 0)
-        #expect(settle(origin: 37, proposed: 900, velocity: 0) == width)
+    @Test("Flicking backwards carries to the previous page")
+    func flickBackwards() {
+        #expect(flicked(from: width * 4, to: width * 4 - 80) == width * 3)
+        #expect(dragged(from: width * 4, to: width * 4 - 80) == width * 4)
     }
 
-    @Test("Both directions behave alike")
-    func symmetric() {
-        for travel in [width * 0.1, width * 0.7, width * 2] as [CGFloat] {
-            let forward = settle(proposed: travel, velocity: fullSpeed)
-            let backward = settle(proposed: -travel, velocity: fullSpeed)
-            #expect(forward == -backward)
-        }
+    @Test("A gesture that goes nowhere does not turn, however fast it was")
+    func motionlessGestureDoesNotTurn() {
+        #expect(settle(origin: width * 2, position: width * 2, velocity: flick * 10) == width * 2)
+        #expect(
+            settle(
+                origin: 0,
+                position: ReaderPaging.minimumTravel - 1,
+                velocity: flick * 10
+            ) == 0
+        )
     }
 
-    @Test("Degenerate input leaves the position where it was")
+    @Test("A drag that is slow and tiny does nothing at all")
+    func tinyDragDoesNothing() {
+        #expect(dragged(to: 1) == 0)
+        #expect(settle(origin: width * 3, position: width * 3 + 1, velocity: 0) == width * 3)
+    }
+
+    @Test("Degenerate input falls back to where the gesture started")
     func degenerateInput() {
-        #expect(ReaderPaging.settleTarget(origin: 12, proposed: 900, pageWidth: 0, velocity: 0) == 12)
-        #expect(ReaderPaging.settleTarget(origin: 12, proposed: 900, pageWidth: -5, velocity: 0) == 12)
-        #expect(ReaderPaging.settleTarget(origin: 12, proposed: .nan, pageWidth: width, velocity: 0) == 12)
+        #expect(ReaderPaging.settleTarget(origin: 12, position: 900, pageWidth: 0, velocity: 0) == 12)
+        #expect(ReaderPaging.settleTarget(origin: 12, position: 900, pageWidth: -5, velocity: 0) == 12)
+        #expect(ReaderPaging.settleTarget(origin: 12, position: .nan, pageWidth: width, velocity: 0) == 12)
     }
 }

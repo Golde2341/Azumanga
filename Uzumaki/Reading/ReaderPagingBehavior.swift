@@ -1,73 +1,93 @@
 import SwiftUI
 
-/// How far a single scroll gesture is allowed to move the horizontal reader.
+/// Where a horizontal gesture is allowed to come to rest.
 ///
-/// The reader wants the next page to be reachable without dragging it the whole way
-/// across the screen, and to never travel further than that neighbour. Both are really the
-/// same question — where a gesture is allowed to come to rest — which is what a
-/// `ScrollTargetBehavior` answers.
+/// The point of this is what it does *not* do. A scroll view will happily report a target
+/// calculated from the gesture's deceleration, so a fast swipe lands several pages along —
+/// pages that flew past too quickly to read. Wanted instead is the desktop swipe: the
+/// pages track the fingers, and letting go settles on whichever page is nearest to where
+/// they stopped. The gesture's own momentum is therefore ignored, and only its speed is
+/// consulted, to carry a flick that stopped short of the halfway point on to the next page.
 ///
 /// The arithmetic lives here, apart from the conformance, so it can be tested directly.
 nonisolated enum ReaderPaging {
-    /// Fraction of a page a *slow* drag must cover before it turns.
-    static let turnThreshold: CGFloat = 0.2
-
-    /// Speed, in points per second, at which distance stops mattering. At or above this,
-    /// any deliberate push turns the page, however little of it has crossed the screen.
+    /// Speed, in points per second, at or above which a gesture counts as a flick and
+    /// turns at least one page however little it moved.
     static let fullSpeedVelocity: CGFloat = 1000
 
-    /// Least travel that can count as a turn, so that a gesture which is fast but goes
-    /// nowhere cannot turn the page on speed alone.
-    static let minimumTravel: CGFloat = 4
+    /// Least a gesture must move to be considered a flick at all, so that a stray tick of
+    /// velocity on a stationary gesture cannot turn a page.
+    static let minimumTravel: CGFloat = 2
 
-    /// Where a gesture should settle, given where it started, where the scroll view would
-    /// land on its own, and how fast the fingers were moving when it ended.
+    /// The offset to settle on.
     ///
-    /// The result is always the page the gesture started on or one of its immediate
-    /// neighbours, so a gesture can never carry the reader further than the next spread.
+    /// - Parameters:
+    ///   - origin: The offset the gesture started from.
+    ///   - position: The offset the fingers had reached when they let go, without momentum.
+    ///   - pageWidth: The width of one spread.
+    ///   - velocity: How fast the gesture was moving.
     static func settleTarget(
         origin: CGFloat,
-        proposed: CGFloat,
+        position: CGFloat,
         pageWidth: CGFloat,
         velocity: CGFloat
     ) -> CGFloat {
-        guard pageWidth > 0, pageWidth.isFinite, origin.isFinite, proposed.isFinite else {
+        guard pageWidth > 0, pageWidth.isFinite, origin.isFinite, position.isFinite else {
+            // Nothing sensible to snap to, and never hand the scroll view a NaN: fall back
+            // to where the gesture started.
             return origin
         }
 
-        // Snap the starting point on to the page grid. It is already on it during normal
-        // scrolling; this matters after a resize has changed how wide a page is, where
-        // an offset from the old grid would otherwise leave the reader between pages.
-        let page = (origin / pageWidth).rounded() * pageWidth
-        let travel = proposed - page
+        // Nearest page to wherever the fingers stopped. Being nearest is what lets a long
+        // swipe cross as many pages as it covers rather than being capped at one.
+        let pages = position / pageWidth
+        let nearest = pages.rounded() * pageWidth
 
-        // The faster the gesture, the less of the page it has to cross. A flick is a
-        // decision already made by the time the fingers lift, so making it wait for a
-        // fixed line means the page arrives late, or not at all.
-        let easing = max(0, 1 - abs(velocity) / fullSpeedVelocity)
-        let required = max(minimumTravel, pageWidth * turnThreshold * easing)
+        let travel = position - origin
+        guard abs(travel) >= minimumTravel, abs(velocity) >= fullSpeedVelocity else {
+            return nearest
+        }
 
-        guard abs(travel) >= required else { return page }
-
-        return page + (travel > 0 ? pageWidth : -pageWidth)
+        // A flick is a decision already made. It carries on to the next page when the
+        // fingers stopped short of it, and takes the nearest page when they did not.
+        let originPage = (origin / pageWidth).rounded()
+        let carried = travel > 0
+            ? max(pages.rounded(), originPage + 1)
+            : min(pages.rounded(), originPage - 1)
+        return carried * pageWidth
     }
+}
+
+/// Carries the scroll view's live offset out to `ReaderPagingBehavior`.
+///
+/// A scroll target behavior is handed the offset a gesture *would* reach once its
+/// deceleration had played out, which is not the offset the fingers let go at. That one is
+/// only knowable from the scroll view itself, so it is kept here and read when the gesture
+/// ends.
+///
+/// Deliberately neither observable nor a value type: it is written on every frame of a
+/// scroll and read only inside `updateTarget`, both on the main thread, so it must not
+/// invalidate the view and must not be copied at the moment it is needed.
+nonisolated final class ReaderScrollOffset: @unchecked Sendable {
+    var value: CGFloat = 0
 }
 
 /// Applies `ReaderPaging` to the reader's horizontal scroll view.
 ///
-/// The scroll view still follows the fingers and still rubber-bands on its own; this only
-/// overrides where a gesture comes to rest.
+/// The scroll view still follows the fingers and still rubber-bands at its ends on its own;
+/// this only overrides where a gesture comes to rest.
 nonisolated struct ReaderPagingBehavior: ScrollTargetBehavior {
     /// Width of one spread, which is the width of the scroll view's container.
     let pageWidth: CGFloat
+    /// The scroll view's live offset.
+    let offset: ReaderScrollOffset
 
     func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
-        let settled = ReaderPaging.settleTarget(
+        target.rect.origin.x = ReaderPaging.settleTarget(
             origin: context.originalTarget.rect.minX,
-            proposed: target.rect.minX,
+            position: offset.value,
             pageWidth: pageWidth,
             velocity: context.velocity.dx
         )
-        target.rect.origin.x = settled
     }
 }

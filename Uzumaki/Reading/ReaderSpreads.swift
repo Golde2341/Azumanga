@@ -29,14 +29,6 @@ nonisolated enum ReaderSpreads {
         return result
     }
 
-    /// The spread to move to, clamped to the available range. `direction` is a
-    /// reading-order step (`+1` next, `-1` previous), already adjusted for
-    /// right-to-left, so this is the only place the bounds are enforced.
-    static func step(from current: Int, by direction: Int, count: Int) -> Int {
-        guard count > 0 else { return 0 }
-        return min(max(0, current + direction), count - 1)
-    }
-
     /// Index of the spread that begins with the given page.
     static func spreadIndex(beginningWith pageIndex: Int, in spreads: [[Page]]) -> Int? {
         spreads.firstIndex { $0.first?.index == pageIndex }
