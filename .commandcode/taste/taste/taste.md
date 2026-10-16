@@ -1,0 +1,17 @@
+# Taste
+- Naming follows the Swift/Apple conventions: PascalCase for types, camelCase for properties and methods. Confidence: 0.9
+- SwiftUI views declare local state with `@State private var` and use `let` for constants. Confidence: 0.85
+- Views conform to `View` and define their UI inside the `body` property. Confidence: 0.8
+- Uses 4-space indentation and separates methods clearly. Confidence: 0.9
+- Keeps imports simple and at the top of the file (e.g. SwiftUI, Foundation) rather than spreading them around. Confidence: 0.75
+- Leverages Swift's strong type system and avoids force unwrapping. Confidence: 0.85
+- Avoids the Combine framework; prefers Swift's `async`/`await` versions of APIs for concurrency. Confidence: 0.9
+- Follows SwiftUI patterns with clear separation of concerns. Confidence: 0.8
+- Adds descriptive comments for complex or non-obvious logic. Confidence: 0.75
+- Uses the Swift Testing framework for unit tests and the XCUIAutomation framework for UI tests. Confidence: 0.85
+- Wants changes limited strictly to what was asked: do not make unrelated changes to other parts of the project. Confidence: 0.85
+- Prefers the Xcode MCP tools ("xcode-tools") for inspecting and building the project, and explicitly wants command-line tools like `ls`/`find` avoided for basic project inspection because command approvals are costly. Confidence: 0.8
+- Prefers consulting the latest Apple developer documentation (via `DocumentationSearch`) rather than assuming APIs from prior knowledge, especially for new frameworks and evolving SwiftUI. Confidence: 0.75
+- When generating markdown tables, always uses leading and trailing pipes on every row (e.g. `| Name | Age |`, never `Name | Age`). Confidence: 0.9
+- For evaluation/investigation work (e.g. judging whether external code or a dependency can be reused), wants a research-first approach: ground findings in real evidence from the actual sources/build files rather than guessing, and deliver a concise report with concrete blockers and estimated effort. Confidence: 0.8
+- Explicitly separates investigation from implementation: when asked to "not implement yet" / "not modify project files", produce analysis and recommendations only, and wait for a follow-up before writing code. Confidence: 0.75
