@@ -17,6 +17,7 @@ final class SettingsStore {
         case language
         case prefetchDistance
         case doublePageFirstPageAlone
+        case readerFullscreen
     }
 
     @ObservationIgnored private let defaults: UserDefaults
@@ -64,6 +65,11 @@ final class SettingsStore {
         didSet { defaults.set(doublePageFirstPageAlone, forKey: Key.doublePageFirstPageAlone.rawValue) }
     }
 
+    /// Remembered so reopening the reader restores the window state you left it in.
+    var readerFullscreen: Bool {
+        didSet { defaults.set(readerFullscreen, forKey: Key.readerFullscreen.rawValue) }
+    }
+
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.layout = ReaderLayoutKind(rawValue: defaults.string(forKey: Key.layout.rawValue) ?? "") ?? .vertical
@@ -75,6 +81,7 @@ final class SettingsStore {
         self.language = defaults.string(forKey: Key.language.rawValue) ?? "en"
         self.prefetchDistance = defaults.object(forKey: Key.prefetchDistance.rawValue) as? Int ?? 3
         self.doublePageFirstPageAlone = defaults.object(forKey: Key.doublePageFirstPageAlone.rawValue) as? Bool ?? true
+        self.readerFullscreen = defaults.object(forKey: Key.readerFullscreen.rawValue) as? Bool ?? false
 
         let ratings = defaults.stringArray(forKey: Key.contentRatings.rawValue)?
             .compactMap(ContentRating.init(rawValue:))

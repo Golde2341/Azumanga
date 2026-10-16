@@ -3,7 +3,10 @@ import SwiftUI
 
 /// Identifies a reading session and carries everything the reader needs, so
 /// opening a chapter never requires re-fetching the manga's chapter list.
-nonisolated struct ReaderSession: Hashable, Identifiable, Sendable {
+///
+/// `Codable` because it is the value of a `WindowGroup`, which lets the reader live
+/// in its own window and survive window restoration.
+nonisolated struct ReaderSession: Hashable, Identifiable, Sendable, Codable {
     var manga: Manga
     var chapters: [Chapter]
     var chapterId: String

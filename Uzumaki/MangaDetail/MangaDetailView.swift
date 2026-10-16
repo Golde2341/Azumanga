@@ -10,6 +10,7 @@ struct MangaDetailView: View {
     @Environment(Services.self) private var services
     @Environment(LibraryModel.self) private var library
     @Environment(DownloadsModel.self) private var downloads
+    @Environment(\.openWindow) private var openWindow
 
     @Query private var progressRecords: [ReadingProgressRecord]
 
@@ -37,9 +38,6 @@ struct MangaDetailView: View {
             }
         }
         .navigationTitle(manga.title)
-        .navigationDestination(for: ReaderSession.self) { session in
-            ReaderContainerView(session: session)
-        }
         .task {
             if model == nil {
                 model = MangaDetailModel(manga: manga, services: services)
@@ -75,7 +73,9 @@ struct MangaDetailView: View {
             } else {
                 Section {
                     ForEach(visibleChapters(model)) { chapter in
-                        NavigationLink(value: session(for: chapter, model: model)) {
+                        Button {
+                            openReader(session(for: chapter, model: model))
+                        } label: {
                             ChapterRow(
                                 chapter: chapter,
                                 isRead: isRead(chapter),
@@ -83,6 +83,7 @@ struct MangaDetailView: View {
                                 downloadState: downloads.state(of: chapter)
                             )
                         }
+                        .buttonStyle(.plain)
                         .contextMenu {
                             Button(isRead(chapter) ? "Mark as Unread" : "Mark as Read") {
                                 model.toggleRead(chapter, isRead: isRead(chapter))
@@ -138,6 +139,11 @@ struct MangaDetailView: View {
 
     private func session(for chapter: Chapter, model: MangaDetailModel) -> ReaderSession {
         ReaderSession(manga: model.details, chapters: model.chapters, chapterId: chapter.chapterId)
+    }
+
+    /// Reading opens in its own window rather than pushing onto this stack.
+    private func openReader(_ session: ReaderSession) {
+        openWindow(value: session)
     }
 
     private func visibleChapters(_ model: MangaDetailModel) -> [Chapter] {
@@ -219,7 +225,9 @@ struct MangaDetailView: View {
 
                 HStack(spacing: 10) {
                     if let resume = model.resumeChapter(lastReadChapterId: entry?.lastReadChapterId) {
-                        NavigationLink(value: session(for: resume, model: model)) {
+                        Button {
+                            openReader(session(for: resume, model: model))
+                        } label: {
                             Label(
                                 progress(for: resume) != nil ? "Continue Reading" : "Start Reading",
                                 systemImage: "book.fill"

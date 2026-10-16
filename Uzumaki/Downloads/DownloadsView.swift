@@ -3,6 +3,7 @@ import SwiftUI
 /// Offline downloads: the queue, what is available offline, and storage use.
 struct DownloadsView: View {
     @Environment(DownloadsModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
@@ -41,9 +42,13 @@ struct DownloadsView: View {
                     if !model.completedRecords.isEmpty {
                         Section("Available Offline") {
                             ForEach(model.completedRecords) { record in
-                                NavigationLink(value: session(for: record)) {
+                                Button {
+                                    openWindow(value: session(for: record))
+                                } label: {
                                     DownloadRow(record: record, progress: model.progress(for: record))
+                                        .contentShape(Rectangle())
                                 }
+                                .buttonStyle(.plain)
                                 .contextMenu {
                                     Button("Delete Download", role: .destructive) { model.delete(record) }
                                 }
@@ -52,9 +57,6 @@ struct DownloadsView: View {
                     }
                 }
                 .listStyle(.inset)
-                .navigationDestination(for: ReaderSession.self) { session in
-                    ReaderContainerView(session: session)
-                }
             }
         }
         .navigationTitle("Downloads")

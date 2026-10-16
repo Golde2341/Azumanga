@@ -260,4 +260,31 @@ struct ReaderModelTests {
         #expect(model.errorMessage != nil)
         #expect(model.pages.isEmpty)
     }
+
+    @Test("A reading session survives being encoded as a window value")
+    func sessionRoundTrips() throws {
+        let session = ReaderSession(
+            manga: Manga(
+                sourceId: "test.pages",
+                mangaId: "m1",
+                title: "Test Manga",
+                coverURL: URL(string: "https://example.test/cover.jpg"),
+                author: "Someone",
+                status: .ongoing
+            ),
+            chapters: chapters(),
+            chapterId: "c2",
+            startPageIndex: 7
+        )
+
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(ReaderSession.self, from: data)
+
+        // `WindowGroup(for:)` needs the value to survive this round trip.
+        #expect(decoded == session)
+        #expect(decoded.chapters.count == 2)
+        #expect(decoded.startPageIndex == 7)
+        #expect(decoded.manga.title == "Test Manga")
+        #expect(decoded.id == session.id)
+    }
 }

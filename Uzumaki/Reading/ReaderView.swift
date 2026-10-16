@@ -44,6 +44,11 @@ struct ReaderView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var showChapterPicker = false
+    /// The window hosting the reader, used to drive full screen.
+    @State private var window: NSWindow?
+    /// The spread on screen, as the id of its first page. Two-way bound to the scroll
+    /// view, so gestures report where they landed and keyboards can drive it back.
+    @State private var scrollPosition: Int?
 
     var body: some View {
         ZStack {
@@ -59,17 +64,18 @@ struct ReaderView: View {
 
             pageIndicator
         }
+        .background(WindowAccessor(window: $window))
         .navigationTitle(model.chapterLabel)
         .toolbar { toolbar }
         .focusable()
         .focusEffectDisabled()
-        .onKeyPress(.leftArrow) { model.previousPage(); return .handled }
-        .onKeyPress(.rightArrow) { model.nextPage(); return .handled }
-        .onKeyPress(.upArrow) { model.previousPage(); return .handled }
-        .onKeyPress(.downArrow) { model.nextPage(); return .handled }
-        .onKeyPress(.space) { model.nextPage(); return .handled }
-        .onKeyPress(.pageUp) { model.previousPage(); return .handled }
-        .onKeyPress(.pageDown) { model.nextPage(); return .handled }
+        .onKeyPress(.leftArrow) { turnSpread(-1); return .handled }
+        .onKeyPress(.rightArrow) { turnSpread(1); return .handled }
+        .onKeyPress(.upArrow) { turnSpread(-1); return .handled }
+        .onKeyPress(.downArrow) { turnSpread(1); return .handled }
+        .onKeyPress(.space) { turnSpread(1); return .handled }
+        .onKeyPress(.pageUp) { turnSpread(-1); return .handled }
+        .onKeyPress(.pageDown) { turnSpread(1); return .handled }
         .onKeyPress("+") { model.zoomIn(); return .handled }
         .onKeyPress("=") { model.zoomIn(); return .handled }
         .onKeyPress("-") { model.zoomOut(); return .handled }
@@ -82,9 +88,41 @@ struct ReaderView: View {
         .sheet(isPresented: $showChapterPicker) {
             ChapterPickerSheet(model: model, isPresented: $showChapterPicker)
         }
+        .onChange(of: window) { _, newValue in
+            guard let newValue else { return }
+            restoreFullScreenPreference(in: newValue)
+        }
+        .task(id: window) {
+            // Track full screen as it actually is, so leaving it with the green
+            // button is remembered just like the toolbar toggle.
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.didEnterFullScreenNotification,
+                object: window
+            ) {
+                settings.readerFullscreen = true
+            }
+        }
+        .task(id: window) {
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.didExitFullScreenNotification,
+                object: window
+            ) {
+                settings.readerFullscreen = false
+            }
+        }
         .onDisappear {
             model.flushProgress()
         }
+    }
+
+    /// Applies the remembered window state when the reader opens.
+    private func restoreFullScreenPreference(in window: NSWindow) {
+        let wantsFullScreen = settings.readerFullscreen
+        let isFullScreen = window.styleMask.contains(.fullScreen)
+        guard wantsFullScreen != isFullScreen else { return }
+        window.toggleFullScreen(nil)
     }
 
     // MARK: - Content
@@ -152,26 +190,85 @@ struct ReaderView: View {
         }
     }
 
+    /// Horizontal paging is the platform's scroll view, with one custom decision about
+    /// where a gesture is allowed to rest.
+    ///
+    /// Every spread is one viewport wide, so the scroll view's own follow-the-finger
+    /// motion, rubber band and deceleration all apply as they are. `ReaderPagingBehavior`
+    /// replaces the default `.paging` snap: a gesture settles on one page at most, and it
+    /// needs less distance the faster it was, so a flick turns the page without having to
+    /// be dragged across the screen first.
     private var horizontalReader: some View {
         GeometryReader { geometry in
+            let size = geometry.size
             ScrollView(.horizontal) {
                 LazyHStack(spacing: 0) {
-                    ForEach(spreads, id: \.first?.index) { spread in
-                        spreadView(spread, size: geometry.size)
-                            .frame(width: geometry.size.width, height: geometry.size.height)
+                    ForEach(Array(spreads.enumerated()), id: \.offset) { _, spread in
+                        spreadView(spread, size: size)
+                            .frame(width: size.width, height: size.height)
                             .id(spread.first?.index ?? 0)
                     }
                 }
                 .scrollTargetLayout()
             }
-            .scrollTargetBehavior(.paging)
-            .scrollPosition(id: positionBinding)
+            .scrollTargetBehavior(ReaderPagingBehavior(pageWidth: size.width))
+            .scrollPosition(id: $scrollPosition, anchor: .center)
             .scrollIndicators(.never)
+            // A zoomed page needs the drag to pan it rather than to turn the page.
+            .scrollDisabled(model.zoom > 1)
+            // Right to left reverses the axis, which is exactly what manga wants.
             .environment(\.layoutDirection, settings.direction == .rightToLeft ? .rightToLeft : .leftToRight)
+            .gesture(zoomGesture)
             .onTapGesture(count: 2) {
                 model.zoom > 1 ? model.resetZoom() : model.setZoom(2)
             }
+            .onAppear { scrollPosition = scrollTargetID }
+            .onChange(of: scrollPosition) { _, newValue in
+                guard let newValue, newValue != scrollTargetID else { return }
+                model.goToPage(newValue)
+            }
+            .onChange(of: model.currentIndex) { _, _ in
+                guard scrollTargetID != scrollPosition else { return }
+                withAnimation(ReaderView.pageTurnAnimation) { scrollPosition = scrollTargetID }
+            }
         }
+    }
+
+    /// Deliberate page turn: one spread, which is one page in single-page mode and a
+    /// facing pair in double-page mode.
+    private func turnSpread(_ direction: Int) {
+        guard settings.layout == .horizontal else {
+            direction > 0 ? model.nextPage() : model.previousPage()
+            return
+        }
+
+        let grid = spreads
+        let step = settings.direction == .rightToLeft ? -direction : direction
+        let next = ReaderSpreads.step(from: currentSpreadIndex, by: step, count: grid.count)
+
+        guard next != currentSpreadIndex, let firstPage = grid[next].first else {
+            // At the end of the chapter, keep the existing behaviour of moving on.
+            direction > 0 ? model.nextPage() : model.previousPage()
+            return
+        }
+        withAnimation(ReaderView.pageTurnAnimation) {
+            scrollPosition = firstPage.index
+        }
+    }
+
+    private static let pageTurnAnimation: Animation = .spring(response: 0.35, dampingFraction: 0.9)
+
+    /// The spread being read. A page that shares a spread with its neighbour has no
+    /// spread starting at it, so fall back to the spread that contains it.
+    private var currentSpreadIndex: Int {
+        ReaderSpreads.spreadIndex(showing: model.currentIndex, in: spreads) ?? 0
+    }
+
+    /// Identity of the spread being read, used to address the scroll view.
+    private var scrollTargetID: Int? {
+        let grid = spreads
+        guard grid.indices.contains(currentSpreadIndex) else { return nil }
+        return grid[currentSpreadIndex].first?.index
     }
 
     @ViewBuilder
@@ -194,21 +291,11 @@ struct ReaderView: View {
 
     /// Pages grouped into single or double spreads.
     private var spreads: [[Page]] {
-        guard settings.pageMode == .double, model.pages.count > 1 else {
-            return model.pages.map { [$0] }
-        }
-        var result: [[Page]] = []
-        var index = 0
-        if settings.doublePageFirstPageAlone {
-            result.append([model.pages[0]])
-            index = 1
-        }
-        while index < model.pages.count {
-            let end = min(index + 2, model.pages.count)
-            result.append(Array(model.pages[index..<end]))
-            index = end
-        }
-        return result
+        ReaderSpreads.group(
+            model.pages,
+            pageMode: settings.pageMode,
+            firstPageAlone: settings.doublePageFirstPageAlone
+        )
     }
 
     private var positionBinding: Binding<Int?> {
@@ -264,7 +351,9 @@ struct ReaderView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
+        // `.cancellationAction` rather than `.navigation`: the reader is its own
+        // window now, and navigation placement only renders inside a stack.
+        ToolbarItem(placement: .cancellationAction) {
             Button {
                 model.flushProgress()
                 dismiss()
@@ -354,7 +443,25 @@ struct ReaderView: View {
     }
 
     private func toggleFullScreen() {
-        (NSApp.keyWindow ?? NSApp.mainWindow)?.toggleFullScreen(nil)
+        (window ?? NSApp.keyWindow ?? NSApp.mainWindow)?.toggleFullScreen(nil)
+    }
+}
+
+/// Reports the window hosting the view, so the reader can control full screen
+/// without guessing which window is key.
+private struct WindowAccessor: NSViewRepresentable {
+    @Binding var window: NSWindow?
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        Task { @MainActor in window = view.window }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        Task { @MainActor in
+            if window !== nsView.window { window = nsView.window }
+        }
     }
 }
 

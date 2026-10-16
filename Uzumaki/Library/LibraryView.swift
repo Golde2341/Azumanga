@@ -5,6 +5,7 @@ import SwiftUI
 /// page bookmarks.
 struct LibraryView: View {
     @Environment(LibraryModel.self) private var library
+    @Environment(\.openWindow) private var openWindow
 
     @State private var filter: Filter = .all
     @State private var selectedCategoryName: String?
@@ -66,9 +67,6 @@ struct LibraryView: View {
         .navigationDestination(for: Manga.self) { manga in
             MangaDetailView(manga: manga)
         }
-        .navigationDestination(for: ReaderSession.self) { session in
-            ReaderContainerView(session: session)
-        }
         .sheet(isPresented: $showingNewCategory) {
             newCategorySheet
         }
@@ -124,7 +122,9 @@ struct LibraryView: View {
         } else {
             List {
                 ForEach(bookmarks) { bookmark in
-                    NavigationLink(value: session(for: bookmark)) {
+                    Button {
+                        openWindow(value: session(for: bookmark))
+                    } label: {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("\(bookmark.mangaTitle) · page \(bookmark.pageIndex + 1)")
                                 .lineLimit(1)
@@ -134,7 +134,10 @@ struct LibraryView: View {
                                 .lineLimit(1)
                         }
                         .padding(.vertical, 2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                     .contextMenu {
                         Button("Remove Bookmark", role: .destructive) {
                             try? library.removeBookmark(bookmark)
