@@ -15,6 +15,11 @@ final class SourcePreferences {
     var installedAt: Date
     var updatedAt: Date
 
+    /// Result of the last health check. `nil` means it has never been checked.
+    var healthRaw: String?
+    var healthDetail: String?
+    var lastCheckedAt: Date?
+
     init(
         sourceId: String,
         name: String,
@@ -23,7 +28,10 @@ final class SourcePreferences {
         isEnabled: Bool = true,
         config: [String: String] = [:],
         installedAt: Date = Date(),
-        updatedAt: Date = Date()
+        updatedAt: Date = Date(),
+        health: SourceHealth = .untested,
+        healthDetail: String? = nil,
+        lastCheckedAt: Date? = nil
     ) {
         self.sourceId = sourceId
         self.name = name
@@ -33,6 +41,14 @@ final class SourcePreferences {
         self.configJSON = Self.encode(config: config)
         self.installedAt = installedAt
         self.updatedAt = updatedAt
+        self.healthRaw = health.rawValue
+        self.healthDetail = healthDetail
+        self.lastCheckedAt = lastCheckedAt
+    }
+
+    var health: SourceHealth {
+        get { SourceHealth(rawValue: healthRaw ?? "") ?? .untested }
+        set { healthRaw = newValue.rawValue }
     }
 
     var config: [String: String] {

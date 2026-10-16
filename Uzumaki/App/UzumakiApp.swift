@@ -19,6 +19,7 @@ struct UzumakiApp: App {
                 .environment(app.discovery)
                 .environment(app.sources)
                 .environment(app.downloads)
+                .environment(app.healthChecker)
                 .environment(\.imagePipeline, app.services.images)
         }
         .modelContainer(app.services.container)

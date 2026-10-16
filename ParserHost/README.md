@@ -97,6 +97,12 @@ One JSON object per line. Requests carry an `id` and a `method`; responses carry
 the same `id` plus either `result` or `error`. `{"event":"ready"}` is emitted
 first.
 
+A request may also carry `timeoutMs` at the top level. The host clamps it to
+1s–600s and uses it for that request only; it defaults to 90s. This exists because
+the app's bulk "check all sources" wants a much shorter deadline than an
+interactive read, and requests are handled serially — without it one dead site
+would hold up every source behind it.
+
 | Method | Params | Result |
 | --- | --- | --- |
 | `ping` | – | `{protocol, sourceCount}` |

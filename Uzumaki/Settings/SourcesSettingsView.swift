@@ -4,12 +4,14 @@ import UniformTypeIdentifiers
 /// Source management: enable/disable, install, configure and remove providers.
 struct SourcesSettingsView: View {
     @Environment(SourcesModel.self) private var model
+    @Environment(SourceHealthChecker.self) private var checker
 
     @State private var showingFileImporter = false
     @State private var showingURLSheet = false
     @State private var manifestURLText = ""
     @State private var configurationTarget: SourceManifest?
     @State private var removalTarget: SourceInfo?
+    @State private var showAllKotatsu = false
 
     var body: some View {
         Form {
@@ -25,28 +27,12 @@ struct SourcesSettingsView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(model.builtInSources) { source in
-                        SourceRow(source: source, manifest: nil, onToggle: setEnabled, onConfigure: nil, onRemove: nil)
+                        SourceRow(source: source, manifest: nil, health: nil, onToggle: setEnabled, onConfigure: nil, onRemove: nil)
                     }
                 }
             }
 
-            Section("Kotatsu (parser host)") {
-                if let reason = model.kotatsuUnavailableReason {
-                    Text(reason)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else if model.kotatsuSources.isEmpty {
-                    Text("No Kotatsu sources are registered.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(model.kotatsuSources) { source in
-                        SourceRow(source: source, manifest: nil, onToggle: setEnabled, onConfigure: nil, onRemove: nil)
-                    }
-                    Text("These parsers run in a separate process bundled with the app. They can be enabled or disabled here, not installed or removed.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            kotatsuSection
 
             Section("Installed") {
                 if model.installedSources.isEmpty {
@@ -57,6 +43,8 @@ struct SourcesSettingsView: View {
                         SourceRow(
                             source: source,
                             manifest: model.manifest(for: source),
+                            health: nil,
+                            healthDetail: nil,
                             onToggle: setEnabled,
                             onConfigure: { manifest in configurationTarget = manifest },
                             onRemove: { _ in removalTarget = source }
@@ -148,6 +136,94 @@ struct SourcesSettingsView: View {
         }
     }
 
+    private var visibleKotatsuSources: [SourceInfo] {
+        model.kotatsuSources(showAll: showAllKotatsu)
+    }
+
+    /// Everything the parser library ships, switchable, with a check that finds the
+    /// ones that actually work.
+    @ViewBuilder
+    private var kotatsuSection: some View {
+        Section("Kotatsu (parser host)") {
+            if let reason = model.kotatsuUnavailableReason {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if model.kotatsuSources.isEmpty {
+                Text("No Kotatsu sources are registered.")
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 10) {
+                    Button {
+                        checker.start(sources: model.kotatsuSources)
+                    } label: {
+                        Label("Check All Sources", systemImage: "stethoscope")
+                    }
+                    .disabled(checker.isRunning)
+
+                    Button {
+                        checker.start(sources: model.kotatsuSources, onlyUntested: true)
+                    } label: {
+                        Label("Check Unchecked", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(checker.isRunning)
+
+                    if checker.isRunning {
+                        Button("Stop") { checker.cancel() }
+                    }
+                }
+
+                if checker.isRunning {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: checker.progress) {
+                            Text("\(checker.completed) of \(checker.total)")
+                                .font(.caption)
+                        }
+                        if let name = checker.currentSourceName {
+                            Text("Checking \(name)…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if let summary = checker.lastRunSummary {
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(summary.contains("0 working") ? .orange : .secondary)
+                }
+
+                Text("\(model.kotatsuSources.count) sources available · \(model.kotatsuWorkingCount) known working · \(model.kotatsuEnabledCount) enabled")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Show all sources, including the ones that are broken or unverified", isOn: $showAllKotatsu)
+                    .font(.caption)
+
+                if visibleKotatsuSources.isEmpty {
+                    Text("Nothing to show yet — run a check to find working sources.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(visibleKotatsuSources) { source in
+                        SourceRow(
+                            source: source,
+                            manifest: nil,
+                            health: model.health(of: source),
+                            healthDetail: model.healthDetail(of: source),
+                            onToggle: setEnabled,
+                            onConfigure: nil,
+                            onRemove: nil
+                        )
+                    }
+                }
+
+                Text("These parsers run in a separate process bundled with the app. They can be enabled or disabled here, not installed or removed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var installFromURLSheet: some View {
         VStack(spacing: 16) {
             Text("Install from URL")
@@ -184,6 +260,8 @@ struct SourcesSettingsView: View {
 private struct SourceRow: View {
     let source: SourceInfo
     let manifest: SourceManifest?
+    var health: SourceHealth?
+    var healthDetail: String?
     let onToggle: (Bool, String) -> Void
     let onConfigure: ((SourceManifest) -> Void)?
     let onRemove: ((SourceInfo) -> Void)?
@@ -195,7 +273,17 @@ private struct SourceRow: View {
                 set: { onToggle($0, source.id) }
             )) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(source.name)
+                    HStack(spacing: 6) {
+                        Text(source.name)
+                        if let health, let badge = health.badge {
+                            Text(badge.text)
+                                .font(.caption2)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(badge.color.opacity(0.15), in: Capsule())
+                                .foregroundStyle(badge.color)
+                        }
+                    }
                     HStack(spacing: 6) {
                         Text("v\(source.version)")
                         Text("·")
@@ -206,6 +294,13 @@ private struct SourceRow: View {
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                    if let healthDetail, !healthDetail.isEmpty {
+                        Text(healthDetail)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
             }
             .toggleStyle(.switch)
@@ -229,6 +324,16 @@ private struct SourceRow: View {
                 }
                 .buttonStyle(.borderless)
             }
+        }
+    }
+}
+
+private extension SourceHealth {
+    var badge: (text: String, color: Color)? {
+        switch self {
+        case .working: ("working", .green)
+        case .failing: ("not working", .orange)
+        case .untested: nil
         }
     }
 }

@@ -10,6 +10,21 @@ nonisolated enum SourceProviderKind: String, Sendable, Hashable, CaseIterable {
     case kotatsuHost
 }
 
+/// Result of the last check that a source actually answers.
+nonisolated enum SourceHealth: String, Sendable, Codable, Hashable, CaseIterable {
+    case untested
+    case working
+    case failing
+}
+
+/// A source that can be cheaply checked for liveness. The app offers this as a
+/// bulk "test all sources" action; sources that don't implement it are probed
+/// through their ordinary listing method instead.
+nonisolated protocol SourceProbing: Sendable {
+    /// - Returns: how many items the source returned. Throwing means unusable.
+    func probe() async throws -> Int
+}
+
 /// Optional behaviours a source may advertise. Views use these to decide which
 /// affordances to show (e.g. a filter button only if `.filters` is supported).
 nonisolated enum SourceCapability: String, Codable, CaseIterable, Sendable, Hashable {

@@ -227,6 +227,10 @@ actor KotatsuHostProcess {
         nextIdentifier += 1
 
         var object: [String: Any] = ["id": identifier, "method": method]
+        // The host enforces the same deadline, so a hanging site can't stall its
+        // single-threaded request loop while the app has already given up.
+        let deadline = timeout ?? defaultTimeout
+        object["timeoutMs"] = Int(deadline / .milliseconds(1))
         if let parameters,
            let encoded = try? JSONEncoder().encode(parameters),
            let decoded = try? JSONSerialization.jsonObject(with: encoded) {
@@ -236,7 +240,6 @@ actor KotatsuHostProcess {
 
         let gate = SingleResume()
         let watchdog = TaskBox()
-        let deadline = timeout ?? defaultTimeout
 
         do {
             let data: Data = try await withCheckedThrowingContinuation { continuation in

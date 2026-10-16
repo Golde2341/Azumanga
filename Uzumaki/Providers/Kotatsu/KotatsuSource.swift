@@ -14,7 +14,7 @@ import Foundation
 ///  * **The parsers are handed back the objects they produced.** `getDetails` and
 ///    `getPages` take the `Manga`/`MangaChapter` they originally returned, so what
 ///    we decode is cached and sent back.
-actor KotatsuSource: MangaSource {
+actor KotatsuSource: MangaSource, SourceProbing {
     nonisolated let id: String
     nonisolated let name: String
     nonisolated let version: String
@@ -77,7 +77,8 @@ actor KotatsuSource: MangaSource {
         page: Int,
         sort: String?,
         query: String?,
-        filters: [MangaFilterValue]
+        filters: [MangaFilterValue],
+        timeout: Duration? = nil
     ) async throws -> PagedResult<Manga> {
         var parameters = KotatsuListParameters(key: sourceKey, offset: max(0, page) * Self.pageSize)
         parameters.query = query?.nilIfBlank
@@ -110,7 +111,7 @@ actor KotatsuSource: MangaSource {
             "list",
             parameters: parameters,
             as: KotatsuMangaListDTO.self,
-            timeout: callTimeout
+            timeout: timeout ?? callTimeout
         )
 
         // Remember the payloads: the parsers need them back for details and pages.
@@ -267,6 +268,20 @@ actor KotatsuSource: MangaSource {
 
     private func preferredSortOrders() async -> [String] {
         (try? await filterOptions().sortOrders) ?? []
+    }
+
+    // MARK: - Health
+
+    /// A short-timeout listing, used by the bulk source check. The timeout is passed
+    /// to the host too, so a hanging site cannot stall the host's request loop.
+    nonisolated var probeTimeout: Duration { .seconds(25) }
+
+    func probe() async throws -> Int {
+        let page = try await list(page: 0, sort: nil, query: nil, filters: [], timeout: probeTimeout)
+        if page.items.isEmpty {
+            throw MangaSourceError.notFound
+        }
+        return page.items.count
     }
 
     // MARK: - Helpers

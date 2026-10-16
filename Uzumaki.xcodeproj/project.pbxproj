@@ -161,21 +161,21 @@
 		FA000000000000000000000C /* Bundle parser host */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
 			name = "Bundle parser host";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# The Kotatsu parser host must live inside the app bundle: the app is\n# sandboxed and cannot read the build directory.\nHOST_JAR=\"${SRCROOT}/ParserHost/build/libs/uzumaki-parser-host-all.jar\"\nDEST=\"${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/ParserHost\"\nif [ -f \"${HOST_JAR}\" ]; then\n  mkdir -p \"${DEST}\"\n  cp -f \"${HOST_JAR}\" \"${DEST}/uzumaki-parser-host-all.jar\"\nelse\n  echo \"warning: ParserHost jar not found at ${HOST_JAR}. Kotatsu sources will be unavailable. Build it with: cd ParserHost && ./gradlew fatJar\"\nfi\n";
+			shellScript = (
+				"# The Kotatsu parser host must live inside the app bundle: the app is",
+				"# sandboxed and cannot read the build directory.",
+				"HOST_JAR=\"${SRCROOT}/ParserHost/build/libs/uzumaki-parser-host-all.jar\"",
+				"DEST=\"${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/ParserHost\"",
+				"if [ -f \"${HOST_JAR}\" ]; then",
+				"  mkdir -p \"${DEST}\"",
+				"  cp -f \"${HOST_JAR}\" \"${DEST}/uzumaki-parser-host-all.jar\"",
+				"else",
+				"  echo \"warning: ParserHost jar not found at ${HOST_JAR}. Kotatsu sources will be unavailable. Build it with: cd ParserHost && ./gradlew fatJar\"",
+				"fi",
+				"",
+			);
 		};
 /* End PBXShellScriptBuildPhase section */
 

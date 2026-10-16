@@ -12,17 +12,26 @@ final class AppEnvironment {
     let discovery: DiscoveryModel
     let sources: SourcesModel
     let downloads: DownloadsModel
+    let healthChecker: SourceHealthChecker
 
     init(container: ModelContainer = PersistenceContainer.shared) {
         let settings = SettingsStore()
         let services = Services(container: container)
+        let sources = SourcesModel(services: services)
+        let healthChecker = SourceHealthChecker(services: services)
 
         self.settings = settings
         self.services = services
         self.library = LibraryModel(services: services)
         self.discovery = DiscoveryModel(services: services)
-        self.sources = SourcesModel(services: services)
+        self.sources = sources
         self.downloads = DownloadsModel(services: services)
+        self.healthChecker = healthChecker
+
+        // A bulk check can run for many minutes; the list should follow along.
+        healthChecker.onResult = { [weak sources] sourceId, snapshot, isEnabled in
+            sources?.applyHealth(snapshot, isEnabled: isEnabled, sourceId: sourceId)
+        }
     }
 
     /// Registers sources and restores the user's enablement. Safe to call more

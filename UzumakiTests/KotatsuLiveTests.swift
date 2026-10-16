@@ -31,7 +31,7 @@ struct KotatsuLiveTests {
         SettingsStore(defaults: UserDefaults(suiteName: "uzumaki.kotatsu.\(UUID().uuidString)")!)
     }
 
-    @Test("Bootstrapping registers the curated Kotatsu sources", .timeLimit(.minutes(2)))
+    @Test("Bootstrapping registers every source, with only the verified ones on", .timeLimit(.minutes(2)))
     func registration() async throws {
         let (services, container) = try makeServices()
         _ = container
@@ -40,10 +40,16 @@ struct KotatsuLiveTests {
 
         let all = await services.registry.all()
         let kotatsu = all.filter { $0.provider == .kotatsuHost }
-        #expect(!kotatsu.isEmpty, "expected at least one Kotatsu source: \(services.kotatsuUnavailableReason ?? "no reason recorded")")
+        #expect(kotatsu.count > 1000, "the whole catalogue should be registered: \(services.kotatsuUnavailableReason ?? "no reason recorded")")
         #expect(services.kotatsuUnavailableReason == nil)
         #expect(kotatsu.allSatisfy { !$0.isBuiltIn })
         #expect(kotatsu.contains { $0.id == "kotatsu.MANGAPILL" })
+
+        // Only the measured-good set is on before any check runs; everything else
+        // waits for the user (or the bulk check) to decide.
+        let enabled = kotatsu.filter(\.isEnabled)
+        #expect(enabled.count == KotatsuCatalog.enabledByDefault.count)
+        #expect(enabled.allSatisfy { KotatsuCatalog.isEnabledByDefault($0.id.replacingOccurrences(of: "kotatsu.", with: "")) })
 
         // And the app's ordinary path can reach one of them.
         let source = try #require(await services.registry.source(id: "kotatsu.MANGAPILL"))
@@ -84,7 +90,14 @@ struct KotatsuLiveTests {
 
         // Pages.
         let chapter = try #require(list.first)
-        let pages = try await source.pages(chapterId: chapter.chapterId)
+        // These are live third-party sites and CDNs throttle; one retry keeps a
+        // momentary hiccup from reading as a product failure.
+        let pages: [Page]
+        do {
+            pages = try await source.pages(chapterId: chapter.chapterId)
+        } catch {
+            pages = try await source.pages(chapterId: chapter.chapterId)
+        }
         #expect(!pages.isEmpty, "expected pages")
         #expect(pages.allSatisfy { HostImageURL.isHostImage($0.url) })
 

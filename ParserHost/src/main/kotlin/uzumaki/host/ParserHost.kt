@@ -44,6 +44,13 @@ class ParserHost(
     private val parsers = ConcurrentHashMap<String, MangaParser>()
     private val cacheDirectory: File = cacheDir.also { it.mkdirs() }
 
+    /**
+     * Timeout for the request currently being handled. Requests are serialised on
+     * one thread, so a single field is enough — and it matters because a bulk source
+     * check wants a much shorter deadline than an interactive read.
+     */
+    private var requestTimeoutMs: Long = callTimeoutMs
+
     private val context: MangaLoaderContext = HostLoaderContext(
         parserLookup = { source -> (source as? MangaParserSource)?.let { parser(it) } },
     )
@@ -62,6 +69,8 @@ class ParserHost(
             id = request.optInt("id", -1)
             val method = request.optString("method")
             val params = request.optJSONObject("params") ?: JSONObject()
+            // The caller may shorten the deadline (used by the app's bulk source check).
+            requestTimeoutMs = request.optLong("timeoutMs", callTimeoutMs).coerceIn(1_000L, 600_000L)
             JSONObject().put("id", id).put("result", dispatch(method, params)).encode()
         } catch (error: Throwable) {
             JSONObject()
@@ -167,7 +176,7 @@ class ParserHost(
      * already knows how to read images from file URLs (and cache them).
      */
     private fun image(params: JSONObject): JSONObject = runBlocking {
-        withTimeout(callTimeoutMs) {
+        withTimeout(requestTimeoutMs) {
             withContext(Dispatchers.IO) {
                 val source = source(params)
                 val url = params.getString("url")
@@ -247,7 +256,7 @@ class ParserHost(
         parsers.computeIfAbsent(source.name) { context.newParserInstance(source) }
 
     private fun <T> call(block: suspend () -> T): T = runBlocking {
-        withTimeout(callTimeoutMs) { block() }
+        withTimeout(requestTimeoutMs) { block() }
     }
 
     private fun errorCode(error: Throwable): String = when (error) {

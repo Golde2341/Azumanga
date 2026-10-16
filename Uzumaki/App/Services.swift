@@ -100,9 +100,14 @@ final class Services {
         await registerKotatsuSources()
     }
 
-    /// Registers the curated Kotatsu sources from the parser host. Never throws:
-    /// if the host cannot answer, the app simply offers no Kotatsu sources and the
-    /// Sources screen explains why.
+    /// Registers every Kotatsu source the host knows about. Never throws: if the
+    /// host cannot answer, the app simply offers no Kotatsu sources and the Sources
+    /// screen explains why.
+    ///
+    /// Sources the host flags as broken are registered but left switched off, so the
+    /// list stays honest instead of hiding them. Everything else starts off too,
+    /// apart from a small verified default set — the bulk check is what turns the
+    /// rest on.
     private func registerKotatsuSources() async {
         guard let kotatsuHost else { return }
 
@@ -113,30 +118,60 @@ final class Services {
                 timeout: .seconds(60)
             )
 
+            // One fetch for the whole registry rather than one per source: with
+            // ~1370 sources the difference is seconds of launch time.
+            let existing = Dictionary(
+                ((try? sourceStore.all()) ?? []).map { ($0.sourceId, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
             var registered = 0
-            for dto in response.items where KotatsuCatalog.isAllowed(dto.key) && !dto.broken {
+
+            for dto in response.items where KotatsuCatalog.isRegistered(dto.key) {
                 let source = KotatsuSource(source: dto, host: kotatsuHost)
-                let stored = try? sourceStore.preferences(for: source.id)
-                // Enabled by default on first run, so the feature is discoverable.
-                let isEnabled = stored?.isEnabled ?? true
+
+                let isEnabled: Bool
+                if let stored = existing[source.id] {
+                    isEnabled = stored.isEnabled
+                } else {
+                    // First sight: a small verified set is on, the rest waits for a
+                    // check. Sources the library flags as broken stay off.
+                    isEnabled = !dto.broken && KotatsuCatalog.isEnabledByDefault(dto.key)
+                }
 
                 await registry.register(source, isEnabled: isEnabled)
-                _ = try? sourceStore.upsert(
-                    sourceId: source.id,
-                    name: source.name,
-                    version: source.version,
-                    isBuiltIn: false,
-                    isEnabled: isEnabled
-                )
+
+                if existing[source.id] == nil {
+                    // Health here is what upstream claims, not something we measured.
+                    sourceStore.insert(
+                        sourceId: source.id,
+                        name: source.name,
+                        version: source.version,
+                        isBuiltIn: false,
+                        isEnabled: isEnabled,
+                        health: dto.broken ? .failing : .untested,
+                        healthDetail: dto.broken ? "Reported as broken by the parser library." : nil
+                    )
+                }
                 registered += 1
             }
+            try? sourceStore.save()
 
             kotatsuUnavailableReason = registered == 0
-                ? "The parser host is running but reported none of the curated sources."
+                ? "The parser host is running but reported no usable sources."
                 : nil
         } catch {
             kotatsuUnavailableReason = "The parser host could not be started: \(userFacingMessage(for: error))"
         }
+    }
+
+    // MARK: - Source health
+
+    func health(for sourceId: String) -> SourceHealthSnapshot {
+        healthSnapshots()[sourceId] ?? SourceHealthSnapshot(health: .untested, detail: nil, checkedAt: nil)
+    }
+
+    func healthSnapshots() -> [String: SourceHealthSnapshot] {
+        (try? sourceStore.healthSnapshot()) ?? [:]
     }
 
     /// Rebuilds provider instances after a settings change that affects them
