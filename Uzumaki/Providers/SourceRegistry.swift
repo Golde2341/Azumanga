@@ -7,6 +7,7 @@ nonisolated struct SourceInfo: Identifiable, Sendable, Hashable {
     let version: String
     let language: String
     let isBuiltIn: Bool
+    let provider: SourceProviderKind
     let capabilities: Set<SourceCapability>
     var isEnabled: Bool
 }
@@ -92,6 +93,7 @@ actor SourceRegistry {
             version: source.version,
             language: source.language,
             isBuiltIn: source.isBuiltIn,
+            provider: source.providerKind,
             capabilities: source.capabilities,
             isEnabled: enabled.contains(source.id)
         )

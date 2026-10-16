@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+
+# Kotlin/JVM parser host build output
+ParserHost/build/
+ParserHost/.gradle/
+ParserHost/runtime/
+ParserHost/.kotlin/
+
+# Gradle
+.gradle/

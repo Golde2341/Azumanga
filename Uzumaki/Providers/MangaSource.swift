@@ -19,6 +19,8 @@ nonisolated protocol MangaSource: Sendable {
     nonisolated var capabilities: Set<SourceCapability> { get }
     /// `true` for sources compiled into the app, `false` for installed ones.
     nonisolated var isBuiltIn: Bool { get }
+    /// Where the implementation comes from, for grouping in the UI.
+    nonisolated var providerKind: SourceProviderKind { get }
 
     func popular(page: Int) async throws -> PagedResult<Manga>
     func latest(page: Int) async throws -> PagedResult<Manga>
@@ -31,6 +33,10 @@ nonisolated protocol MangaSource: Sendable {
 
 nonisolated extension MangaSource {
     nonisolated var isBuiltIn: Bool { false }
+
+    /// Default: compiled-in native sources are built-in, everything else is a
+    /// user-installed script.
+    nonisolated var providerKind: SourceProviderKind { isBuiltIn ? .builtIn : .scripted }
 
     /// Sources default to no filters; overriding is optional.
     func filters() async throws -> [MangaFilter] { [] }

@@ -78,16 +78,37 @@ struct PersistenceTests {
         #expect(try progress.readChapterIds(sourceId: "org.mangadex", mangaId: "m1") == ["c1"])
     }
 
-    @Test("Bookmarks toggle on and off")
+    @Test("Bookmarks toggle on and off and keep their titles")
     func bookmarkToggle() throws {
         let container = try inMemoryContainer()
         let bookmarks = BookmarkStore(context: container.mainContext)
 
-        let added = try bookmarks.toggle(sourceId: "org.mangadex", mangaId: "m1", chapterId: "c1", pageIndex: 5)
+        let added = try bookmarks.toggle(
+            sourceId: "org.mangadex",
+            mangaId: "m1",
+            mangaTitle: "Test Manga",
+            chapterId: "c1",
+            chapterTitle: "Chapter 1",
+            pageIndex: 5
+        )
         #expect(added)
         #expect(try bookmarks.contains(sourceId: "org.mangadex", mangaId: "m1", chapterId: "c1", pageIndex: 5))
 
-        let removed = try bookmarks.toggle(sourceId: "org.mangadex", mangaId: "m1", chapterId: "c1", pageIndex: 5)
+        let stored = try bookmarks.bookmarks(sourceId: "org.mangadex", mangaId: "m1")
+        #expect(stored.count == 1)
+        #expect(stored.first?.mangaTitle == "Test Manga")
+        #expect(stored.first?.chapterTitle == "Chapter 1")
+        #expect(stored.first?.pageIndex == 5)
+        #expect(stored.first?.manga.title == "Test Manga")
+
+        let removed = try bookmarks.toggle(
+            sourceId: "org.mangadex",
+            mangaId: "m1",
+            mangaTitle: "Test Manga",
+            chapterId: "c1",
+            chapterTitle: "Chapter 1",
+            pageIndex: 5
+        )
         #expect(!removed)
         #expect(try bookmarks.all().isEmpty)
     }

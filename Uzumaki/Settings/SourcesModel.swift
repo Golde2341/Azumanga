@@ -13,22 +13,29 @@ final class SourcesModel {
     var errorMessage: String?
     var infoMessage: String?
     var isInstalling = false
+    /// Set when the parser host is missing or unusable.
+    var kotatsuUnavailableReason: String?
 
     init(services: Services) {
         self.services = services
     }
 
     var builtInSources: [SourceInfo] {
-        sources.filter(\.isBuiltIn)
+        sources.filter { $0.provider == .builtIn }
+    }
+
+    var kotatsuSources: [SourceInfo] {
+        sources.filter { $0.provider == .kotatsuHost }
     }
 
     var installedSources: [SourceInfo] {
-        sources.filter { !$0.isBuiltIn }
+        sources.filter { $0.provider == .scripted }
     }
 
     func refresh() async {
         sources = await services.registry.all()
         installedManifests = services.installer.installedManifests()
+        kotatsuUnavailableReason = services.kotatsuUnavailableReason
     }
 
     func setEnabled(_ isEnabled: Bool, id: String) async {

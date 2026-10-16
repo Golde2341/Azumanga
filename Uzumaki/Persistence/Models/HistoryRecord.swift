@@ -34,4 +34,8 @@ final class HistoryRecord {
     }
 
     var coverURL: URL? { coverURLString.flatMap(URL.init(string:)) }
+
+    var manga: Manga {
+        Manga(sourceId: sourceId, mangaId: mangaId, title: title, coverURL: coverURL)
+    }
 }

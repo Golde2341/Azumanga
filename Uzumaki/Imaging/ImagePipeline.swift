@@ -22,12 +22,20 @@ actor ImagePipeline {
     private let http: HTTPClient
     private let memory: MemoryImageCache
     private let disk: DiskImageCache
+    /// Optional provider host used for images that the app must not fetch directly.
+    private let hostResolver: (any HostImageResolving)?
     private var inFlight: [Key: Task<ImageLoadResult, any Error>] = [:]
 
-    init(http: HTTPClient, memory: MemoryImageCache, disk: DiskImageCache) {
+    init(
+        http: HTTPClient,
+        memory: MemoryImageCache,
+        disk: DiskImageCache,
+        hostResolver: (any HostImageResolving)? = nil
+    ) {
         self.http = http
         self.memory = memory
         self.disk = disk
+        self.hostResolver = hostResolver
     }
 
     // MARK: - Loading
@@ -45,8 +53,16 @@ actor ImagePipeline {
         let http = http
         let memory = memory
         let disk = disk
+        let hostResolver = hostResolver
         let task = Task<ImageLoadResult, any Error> {
-            try await Self.fetch(url: url, key: key, http: http, memory: memory, disk: disk)
+            try await Self.fetch(
+                url: url,
+                key: key,
+                http: http,
+                memory: memory,
+                disk: disk,
+                hostResolver: hostResolver
+            )
         }
         inFlight[key] = task
         defer { inFlight[key] = nil }
@@ -84,8 +100,16 @@ actor ImagePipeline {
             let http = http
             let memory = memory
             let disk = disk
+            let hostResolver = hostResolver
             let task = Task<ImageLoadResult, any Error> {
-                try await Self.fetch(url: url, key: key, http: http, memory: memory, disk: disk)
+                try await Self.fetch(
+                    url: url,
+                    key: key,
+                    http: http,
+                    memory: memory,
+                    disk: disk,
+                    hostResolver: hostResolver
+                )
             }
             inFlight[key] = task
             Task {
@@ -124,12 +148,31 @@ actor ImagePipeline {
         key: Key,
         http: HTTPClient,
         memory: MemoryImageCache,
-        disk: DiskImageCache
+        disk: DiskImageCache,
+        hostResolver: (any HostImageResolving)?
     ) async throws -> ImageLoadResult {
         if let data = disk.data(forKey: key.diskKey),
            let image = Downsampler.downsample(data, maxPixelSize: key.maxPixelSize) {
             memory.insert(image, forKey: key.memoryKey)
             return ImageLoadResult(image: image, byteCount: data.count, wasCached: true)
+        }
+
+        // Images owned by a provider host: only the host can fetch these, because
+        // it carries the parser's headers, cookies and descrambling.
+        if let (sourceKey, remote) = HostImageURL.parse(url) {
+            guard let hostResolver else {
+                throw MangaSourceError.provider("This image needs the parser host, which is unavailable.")
+            }
+            let localFile = try await hostResolver.localImageFile(sourceKey: sourceKey, remote: remote)
+            guard let data = try? Data(contentsOf: localFile),
+                  let image = Downsampler.downsample(data, maxPixelSize: key.maxPixelSize)
+            else {
+                throw MangaSourceError.decoding("Unsupported image data")
+            }
+            // Cached against the logical URL, so repeated reads stay a cache hit.
+            disk.store(data, forKey: key.diskKey)
+            memory.insert(image, forKey: key.memoryKey)
+            return ImageLoadResult(image: image, byteCount: data.count, wasCached: false)
         }
 
         // Offline downloads are addressed as file URLs; read them directly.

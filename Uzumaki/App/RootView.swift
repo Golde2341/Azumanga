@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
@@ -59,6 +60,14 @@ struct RootView: View {
         }
         .task {
             await app.bootstrap()
+        }
+        .task {
+            // Stop the parser host when the app goes away. It exits on stdin EOF
+            // too, but relying on that leaves JVMs lingering after a kill.
+            for await _ in NotificationCenter.default.notifications(named: NSApplication.willTerminateNotification) {
+                await app.services.kotatsuHost?.shutdown()
+                break
+            }
         }
     }
 }

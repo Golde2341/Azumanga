@@ -1,5 +1,15 @@
 import Foundation
 
+/// Where a source's implementation comes from. The UI groups by this.
+nonisolated enum SourceProviderKind: String, Sendable, Hashable, CaseIterable {
+    /// Compiled into the app as native Swift.
+    case builtIn
+    /// A JavaScript provider installed by the user at runtime.
+    case scripted
+    /// A parser running in the external parser host.
+    case kotatsuHost
+}
+
 /// Optional behaviours a source may advertise. Views use these to decide which
 /// affordances to show (e.g. a filter button only if `.filters` is supported).
 nonisolated enum SourceCapability: String, Codable, CaseIterable, Sendable, Hashable {

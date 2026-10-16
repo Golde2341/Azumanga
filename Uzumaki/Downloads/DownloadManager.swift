@@ -7,6 +7,9 @@ actor DownloadManager {
     private let http: HTTPClient
     private let directories: DownloadDirectories
     private let maxConcurrentJobs: Int
+    /// Needed for pages owned by a provider host: their URLs are not fetchable
+    /// directly, only through the host that owns the parser.
+    private let hostResolver: (any HostImageResolving)?
 
     private var runningJobs = 0
     private var waitingSlots: [CheckedContinuation<Void, Never>] = []
@@ -15,12 +18,14 @@ actor DownloadManager {
         registry: SourceRegistry,
         http: HTTPClient,
         directories: DownloadDirectories = DownloadDirectories(),
-        maxConcurrentJobs: Int = 2
+        maxConcurrentJobs: Int = 2,
+        hostResolver: (any HostImageResolving)? = nil
     ) {
         self.registry = registry
         self.http = http
         self.directories = directories
         self.maxConcurrentJobs = max(1, maxConcurrentJobs)
+        self.hostResolver = hostResolver
     }
 
     // MARK: - Downloading
@@ -63,6 +68,23 @@ actor DownloadManager {
                 continue
             }
 
+            let file = directories.pageFile(in: directory, index: page.index, sourceURL: page.url)
+
+            // Pages owned by a provider host only resolve through that host.
+            if let (sourceKey, remoteURL) = HostImageURL.parse(page.url) {
+                guard let hostResolver else {
+                    throw MangaSourceError.provider("This chapter needs the parser host, which is unavailable.")
+                }
+                let localFile = try await hostResolver.localImageFile(sourceKey: sourceKey, remote: remoteURL)
+                try? FileManager.default.removeItem(at: file)
+                try FileManager.default.copyItem(at: localFile, to: file)
+                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                bytes += Int64(size)
+                completed += 1
+                await onProgress(DownloadProgress(completedPages: completed, totalPages: remote.count, byteCount: bytes))
+                continue
+            }
+
             var request = URLRequest(url: page.url)
             for (key, value) in page.headers {
                 request.setValue(value, forHTTPHeaderField: key)
@@ -70,7 +92,6 @@ actor DownloadManager {
             request.setValue("image/*", forHTTPHeaderField: "Accept")
 
             let response = try await http.data(for: request, allowRetry: true)
-            let file = directories.pageFile(in: directory, index: page.index, sourceURL: page.url)
             try response.data.write(to: file, options: .atomic)
 
             bytes += Int64(response.data.count)

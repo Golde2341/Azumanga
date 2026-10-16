@@ -114,8 +114,13 @@ final class DiscoveryModel {
         do {
             let page = try await fetch(source: source, page: currentPage + 1)
             let existing = Set(results.map(\.id))
-            results.append(contentsOf: page.items.filter { !existing.contains($0.id) })
-            hasNextPage = page.hasNextPage
+            let fresh = page.items.filter { !existing.contains($0.id) }
+            results.append(contentsOf: fresh)
+
+            // Some sources return a fixed page regardless of offset, and Kotatsu's
+            // host has no reliable end-of-list signal. Treating a page that adds
+            // nothing new as the end stops an endless scroll that shows nothing.
+            hasNextPage = page.hasNextPage && !fresh.isEmpty
             currentPage += 1
         } catch is CancellationError {
             // Superseded.

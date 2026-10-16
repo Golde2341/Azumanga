@@ -30,6 +30,24 @@ struct SourcesSettingsView: View {
                 }
             }
 
+            Section("Kotatsu (parser host)") {
+                if let reason = model.kotatsuUnavailableReason {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if model.kotatsuSources.isEmpty {
+                    Text("No Kotatsu sources are registered.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.kotatsuSources) { source in
+                        SourceRow(source: source, manifest: nil, onToggle: setEnabled, onConfigure: nil, onRemove: nil)
+                    }
+                    Text("These parsers run in a separate process bundled with the app. They can be enabled or disabled here, not installed or removed.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("Installed") {
                 if model.installedSources.isEmpty {
                     Text("No third-party sources are installed.")
