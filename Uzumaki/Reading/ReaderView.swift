@@ -86,6 +86,15 @@ struct ReaderView: View {
     @State private var showsDisplayOptions = false
     /// Where along the progress bar a drag has reached, while it is being dragged.
     @State private var isScrubbing = false
+    /// The scroll view backing the vertical reader, used for native magnification.
+    @State private var verticalScrollView: NSScrollView?
+    /// Whether a pinch is in flight. While the pages change size under the scroll
+    /// view, its intermediate positions must not be treated as page turns.
+    @State private var isMagnifying = false
+    /// The zoom the current pinch started from, so repeated pinches accumulate.
+    @State private var zoomGestureBase: CGFloat = 1
+    /// The point under the pointer when a pinch starts, used to keep it there.
+    @State private var zoomAnchor: ReaderZoomAnchor?
     /// Whether the corner grip is driving the window size. The controls must stay
     /// visible while it is.
     @State private var isResizingWindow = false
@@ -533,20 +542,30 @@ struct ReaderView: View {
 
     private var verticalReader: some View {
         GeometryReader { geometry in
+            let pageWidth = geometry.size.width
+            let zoom = model.zoom
+            // Zoom changes the pages' real layout size, so the lazy stack knows
+            // exactly what is on screen. Zoombed out, the stack is the window's width
+            // and the smaller pages sit centred inside it, leaving bars on both sides.
+            let contentWidth = max(pageWidth, pageWidth * zoom)
+
             ScrollView([.vertical, .horizontal]) {
                 LazyVStack(spacing: 0) {
                     ForEach(model.pages) { page in
                         AsyncPageImage(page: page, maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
-                            .frame(width: geometry.size.width * model.zoom)
+                            .frame(width: pageWidth * zoom)
                             .id(page.index)
                     }
                 }
-                .frame(minWidth: geometry.size.width)
+                .frame(width: contentWidth)
                 .scrollTargetLayout()
+                // Inside the scroll content, so it is definitely the scroll view
+                // containing it that gets found.
+                .background(ScrollViewAccessor(scrollView: $verticalScrollView))
             }
             .scrollPosition(id: positionBinding)
             .scrollIndicators(.never)
-            .gesture(zoomGesture)
+            .gesture(verticalZoomGesture)
             .onTapGesture(count: 2) {
                 model.zoom > 1 ? model.resetZoom() : model.setZoom(2)
             }
@@ -672,7 +691,12 @@ struct ReaderView: View {
         Binding(
             get: { model.currentIndex },
             set: { newValue in
-                if let newValue { model.goToPage(newValue) }
+                // Magnifying changes every page's width, which shifts the scroll
+                // view's idea of the current page. Those intermediate positions are
+                // not page turns: feeding them back made the reader fight itself,
+                // flicker between placeholder and page, and jump up and down.
+                guard !isMagnifying, let newValue else { return }
+                model.goToPage(newValue, resetZoom: false)
             }
         )
     }
@@ -680,8 +704,78 @@ struct ReaderView: View {
     private var zoomGesture: some Gesture {
         MagnifyGesture()
             .onChanged { value in
-                model.setZoom(value.magnification)
+                if !isMagnifying {
+                    isMagnifying = true
+                    zoomGestureBase = model.zoom
+                }
+                model.setZoom(zoomGestureBase * value.magnification)
             }
+            .onEnded { _ in
+                zoomGestureBase = model.zoom
+                isMagnifying = false
+            }
+    }
+
+    /// Enables the scroll view's magnification used by the vertical reader. The pinch
+    /// itself is handled by `verticalZoomGesture`, which applies the zoom at the
+    /// pointer; programmatic zoom still works while user magnification is off.
+    /// The vertical reader's pinch. Layout zoom keeps the lazy stack's page rendering
+    /// in step with what is visible; when the pinch ends the scroll offset is moved so
+    /// the point that was under the pointer is under it again.
+    private var verticalZoomGesture: some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                if !isMagnifying {
+                    isMagnifying = true
+                    zoomGestureBase = model.zoom
+                    zoomAnchor = captureZoomAnchor(zoom: model.zoom)
+                }
+                model.setZoom(zoomGestureBase * value.magnification)
+            }
+            .onEnded { _ in
+                restoreZoomAnchor()
+                zoomGestureBase = model.zoom
+                isMagnifying = false
+            }
+    }
+
+    private func captureZoomAnchor(zoom: CGFloat) -> ReaderZoomAnchor? {
+        guard let scrollView = verticalScrollView,
+              let window = scrollView.window
+        else { return nil }
+
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let clip = scrollView.contentView
+        let documentPoint = clip.convert(windowPoint, from: nil)
+        let viewportPoint = NSPoint(
+            x: documentPoint.x - clip.bounds.origin.x,
+            y: documentPoint.y - clip.bounds.origin.y
+        )
+        return ReaderZoomAnchor(
+            documentPoint: documentPoint,
+            viewportPoint: viewportPoint,
+            zoom: zoom
+        )
+    }
+
+    private func restoreZoomAnchor() {
+        guard let anchor = zoomAnchor, let scrollView = verticalScrollView else {
+            zoomAnchor = nil
+            return
+        }
+        zoomAnchor = nil
+
+        let ratio = model.zoom / anchor.zoom
+        guard ratio.isFinite, ratio > 0 else { return }
+
+        let origin = NSPoint(
+            x: anchor.documentPoint.x * ratio - anchor.viewportPoint.x,
+            y: anchor.documentPoint.y * ratio - anchor.viewportPoint.y
+        )
+        Task { @MainActor in
+            scrollView.contentView.setBoundsOrigin(origin)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
     }
 
     private var pageIndicator: some View {
@@ -1403,6 +1497,34 @@ private struct ReaderResizeGrip: NSViewRepresentable {
             startMouse = nil
             didDrag = false
             onEnded?()
+        }
+    }
+}
+
+/// A point on the page, the matching point in the viewport, and the zoom it was
+/// captured at — used to keep the page under the pointer while zooming.
+private struct ReaderZoomAnchor {
+    let documentPoint: CGPoint
+    let viewportPoint: CGPoint
+    let zoom: CGFloat
+}
+
+/// Reports the `NSScrollView` backing a SwiftUI `ScrollView`, so the reader can turn
+/// on the platform's native magnification.
+private struct ScrollViewAccessor: NSViewRepresentable {
+    @Binding var scrollView: NSScrollView?
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        Task { @MainActor in scrollView = view.enclosingScrollView }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        Task { @MainActor in
+            if scrollView !== nsView.enclosingScrollView {
+                scrollView = nsView.enclosingScrollView
+            }
         }
     }
 }

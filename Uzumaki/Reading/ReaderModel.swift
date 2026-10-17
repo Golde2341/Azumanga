@@ -199,12 +199,12 @@ final class ReaderModel {
 
     // MARK: - Navigation
 
-    func goToPage(_ index: Int, save: Bool = true) {
+    func goToPage(_ index: Int, save: Bool = true, resetZoom: Bool = true) {
         guard !pages.isEmpty else { return }
         let clamped = min(max(0, index), pages.count - 1)
         guard clamped != currentIndex else { return }
         currentIndex = clamped
-        zoom = 1
+        if resetZoom { zoom = 1 }
         if save { scheduleSave() }
         prefetchAhead()
     }
@@ -239,8 +239,13 @@ final class ReaderModel {
 
     // MARK: - Zoom
 
+    /// Zoom range for the reader. Below 1 the page shrinks inside the window,
+    /// leaving bars around it; above 1 it grows past the window.
+    static let minZoom: CGFloat = 0.5
+    static let maxZoom: CGFloat = 5
+
     func setZoom(_ value: CGFloat) {
-        zoom = min(max(1, value), 5)
+        zoom = min(max(Self.minZoom, value), Self.maxZoom)
     }
 
     func zoomIn() { setZoom(zoom + 0.5) }
