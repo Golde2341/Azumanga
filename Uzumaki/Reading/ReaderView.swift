@@ -35,7 +35,7 @@ struct ReaderContainerView: View {
     }
 }
 
-/// The reading surface: vertical continuous or horizontal paged, with zoom,
+/// The reading surface: a continuous vertical or horizontal stream, with zoom,
 /// keyboard shortcuts, chapter navigation and automatic progress saving.
 ///
 /// The window itself is managed by the scene (`.windowStyle(.hiddenTitleBar)` in
@@ -71,12 +71,23 @@ struct ReaderView: View {
     @State private var windowedSizeLimits: (min: NSSize, max: NSSize)?
     /// The app's presentation options from before full screen, restored when leaving.
     @State private var savedPresentationOptions: NSApplication.PresentationOptions = []
-    /// The spread on screen, as the id of its first page. Two-way bound to the scroll
+    /// The spread (or chapter break) on screen. Two-way bound to the horizontal scroll
     /// view, so a gesture reports where it landed and a keyboard turn can drive it back.
-    @State private var spreadPosition: Int?
+    @State private var spreadPosition: ReaderStreamItemID?
     /// Vertical reader page tracking, kept out of observable state so scrolling never
     /// re-renders or moves the view.
     @State private var verticalScrollTracker = ReaderVerticalScrollTracker()
+    /// Chapters currently in the reader, in reading order. The first is the chapter
+    /// the model opened; following ones are loaded before they are reached.
+    @State private var sections: [ReaderSection] = []
+    /// The chapter id currently being fetched for the end of the stream.
+    @State private var loadingSectionID: String?
+    /// A chapter at the end of the stream that could not be loaded, so the break can
+    /// offer a retry instead of asking again on every scroll pause.
+    @State private var failedSectionID: String?
+    /// A page the reader should scroll to because the model moved for a reason other
+    /// than scrolling: initial restore, chapter jump, or keyboard.
+    @State private var pendingScrollPageID: ReaderPageID?
     /// The scroll view's live offset, which the paging behavior reads when a gesture ends.
     @State private var scrollOffset = ReaderScrollOffset()
     /// Whether the reader's own controls are on screen. They stay out of the way while
@@ -225,6 +236,15 @@ struct ReaderView: View {
         .onAppear {
             revealControls()
             scheduleIntroIfNeeded()
+            syncSectionsFromModel()
+        }
+        .onChange(of: model.pages) { _, _ in
+            syncSectionsFromModel()
+        }
+        .onChange(of: model.chapterCount) { _, _ in
+            // A reader opened without a chapter list gets it in the background.
+            // Once it arrives, the continuous stream can grow past the first chapter.
+            syncSectionsFromModel()
         }
         // The window hosting the view, reported by AppKit rather than guessed from
         // whichever window happens to be key.
@@ -249,8 +269,8 @@ struct ReaderView: View {
         .onKeyPress("=") { model.zoomIn(); return .handled }
         .onKeyPress("-") { model.zoomOut(); return .handled }
         .onKeyPress("0") { model.resetZoom(); return .handled }
-        .onKeyPress("[") { Task { await model.goToChapter(index: model.currentChapterIndex - 1) }; return .handled }
-        .onKeyPress("]") { Task { await model.goToChapter(index: model.currentChapterIndex + 1) }; return .handled }
+        .onKeyPress("[") { goToAdjacentChapter(-1); return .handled }
+        .onKeyPress("]") { goToAdjacentChapter(1); return .handled }
         .onKeyPress("b") { model.toggleBookmark(); return .handled }
         .onKeyPress("f") { toggleFullScreen(); return .handled }
         .onKeyPress(.escape) {
@@ -268,9 +288,10 @@ struct ReaderView: View {
         .sheet(isPresented: $showChapterPicker) {
             ChapterPickerSheet(model: model, isPresented: $showChapterPicker)
         }
-        .task(id: model.currentIndex) {
+        .task(id: "\(model.chapter.chapterId):\(model.currentIndex)") {
             // A page's proportions are only knowable once its image has been loaded, so this
-            // looks again a few times before settling for the stand-in.
+            // looks again a few times before settling for the stand-in. Keyed by chapter id
+            // as well: crossing chapters can leave the page index unchanged.
             for attempt in 0..<4 {
                 await readPageAspect()
                 if let window {
@@ -282,13 +303,21 @@ struct ReaderView: View {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-        .onChange(of: settings.layout) { _, _ in
-            guard let window else { return }
-            if settings.layout == .vertical {
+        .onChange(of: settings.layout) { _, newLayout in
+            if newLayout == .vertical {
                 // Releasing the lock must not wait on full-screen bookkeeping; this
                 // only clears the ratio and any stuck size limit, it never resizes.
                 applyWindowShape()
+                syncSectionsFromModel()
+                // The vertical scroll view is new; open it where the reader is.
+                if let id = currentVerticalPageID {
+                    verticalScrollTracker.topPageID = id
+                    verticalScrollTracker.lastAppliedPageID = id
+                    verticalScrollTracker.isRestoring = true
+                    pendingScrollPageID = id
+                }
             }
+            guard let window else { return }
             reconcileWindow(window, resizingWindowShape: true)
         }
         .onChange(of: settings.pageMode) { _, _ in
@@ -355,6 +384,7 @@ struct ReaderView: View {
             if isReaderFullScreen, NSApp.isActive {
                 NSApp.presentationOptions = savedPresentationOptions
             }
+            verticalScrollTracker.applyTask?.cancel()
             model.flushProgress()
         }
     }
@@ -556,6 +586,12 @@ struct ReaderView: View {
         }
     }
 
+    /// The vertical stream: every loaded chapter's pages, with a break between them.
+    ///
+    /// A page keeps the same fixed slot whether it is the first page of the chapter
+    /// or the last, so appending the next episode below the stream cannot move the
+    /// viewport. The model follows the scroll only when the gesture settles, and the
+    /// view never binds its scroll position to the model.
     private var verticalReader: some View {
         GeometryReader { geometry in
             let pageWidth = geometry.size.width
@@ -574,22 +610,15 @@ struct ReaderView: View {
             ScrollViewReader { proxy in
                 ScrollView([.vertical, .horizontal]) {
                     LazyVStack(spacing: 0) {
-                        ForEach(model.pages) { page in
-                            AsyncPageImage(page: page, maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
-                                .frame(width: pageWidth * zoom, height: pageHeight)
-                                .id(page.index)
-                                .background {
-                                    GeometryReader { pageGeometry in
-                                        Color.clear.preference(
-                                            key: ReaderVerticalPageTopsKey.self,
-                                            value: [
-                                                page.index: pageGeometry
-                                                    .frame(in: .named("verticalReader"))
-                                                    .minY
-                                            ]
-                                        )
-                                    }
-                                }
+                        // Flattened deliberately: pages must be direct children of the
+                        // lazy stack, not pages nested inside a lazy row, or the whole
+                        // chapter is built (and its images loaded) at once.
+                        ForEach(verticalItems) { item in
+                            verticalItemView(
+                                item,
+                                pageWidth: pageWidth * zoom,
+                                pageHeight: pageHeight
+                            )
                         }
                     }
                     .frame(width: contentWidth)
@@ -615,28 +644,34 @@ struct ReaderView: View {
                     }
                 }
                 // Only a model change that did not come from scrolling moves the
-                // view: keyboard turns, the scrubber and chapter navigation.
-                .onChange(of: model.currentIndex) { _, newValue in
+                // view: keyboard turns, the scrubber, restoring a page in a new
+                // stream. Crossing a chapter while scrolling sets `lastApplied`
+                // first, so it is recognised and leaves the scroll alone.
+                .onChange(of: currentVerticalPageID) { _, newValue in
                     guard !verticalScrollTracker.isUserScrolling,
-                          newValue != verticalScrollTracker.lastAppliedIndex
+                          !verticalScrollTracker.isApplyingModelChange,
+                          let newValue,
+                          newValue != verticalScrollTracker.lastAppliedPageID
                     else { return }
-                    verticalScrollTracker.topPageIndex = newValue
-                    verticalScrollTracker.lastAppliedIndex = newValue
+                    verticalScrollTracker.topPageID = newValue
+                    verticalScrollTracker.lastAppliedPageID = newValue
                     proxy.scrollTo(newValue, anchor: .top)
                 }
-                .onChange(of: model.pages) { _, _ in
-                    Task { @MainActor in
-                        verticalScrollTracker.topPageIndex = model.currentIndex
-                        verticalScrollTracker.lastAppliedIndex = model.currentIndex
-                        proxy.scrollTo(model.currentIndex, anchor: .top)
-                    }
+                .onChange(of: pendingScrollPageID) { _, _ in
+                    performPendingScroll(proxy)
                 }
                 .onAppear {
-                    Task { @MainActor in
-                        verticalScrollTracker.topPageIndex = model.currentIndex
-                        verticalScrollTracker.lastAppliedIndex = model.currentIndex
-                        proxy.scrollTo(model.currentIndex, anchor: .top)
+                    // A freshly mounted scroll view is not mid-gesture. Clear any
+                    // flags left behind if the reader was replaced during a scroll.
+                    verticalScrollTracker.isUserScrolling = false
+                    verticalScrollTracker.isApplyingModelChange = false
+                    // The reader can be re-created (layout switch, recovering from a
+                    // load error) while the stream state survives. Open at the page
+                    // being read rather than at the top of the first loaded chapter.
+                    if pendingScrollPageID == nil, let id = currentVerticalPageID {
+                        pendingScrollPageID = id
                     }
+                    performPendingScroll(proxy)
                 }
                 .scrollIndicators(.never)
                 .gesture(verticalZoomGesture)
@@ -647,27 +682,310 @@ struct ReaderView: View {
         }
     }
 
-    /// The page whose top edge most recently crossed the viewport's top edge. It is
-    /// only recorded here; the model follows when the scroll ends.
-    private func trackVerticalPage(_ tops: [Int: CGFloat]) {
-        guard !isMagnifying, !tops.isEmpty else { return }
+    /// Every loaded page followed by its chapter's break, as one flat list of lazy
+    /// rows. Separators are fixed-height so loading the next episode never changes
+    /// the height of the content above the viewport.
+    private var verticalItems: [ReaderVerticalItem] {
+        sections.flatMap { section in
+            section.pages.map {
+                ReaderVerticalItem.page(chapterId: section.chapterId, page: $0)
+            } + [.chapterBreak(chapterId: section.chapterId)]
+        }
+    }
+
+    @ViewBuilder
+    private func verticalItemView(
+        _ item: ReaderVerticalItem,
+        pageWidth: CGFloat,
+        pageHeight: CGFloat
+    ) -> some View {
+        switch item {
+        case let .page(chapterId, page):
+            let id = ReaderPageID(chapterId: chapterId, pageIndex: page.index)
+            AsyncPageImage(page: page, maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
+                .frame(width: pageWidth, height: pageHeight)
+                .id(id)
+                .background {
+                    GeometryReader { pageGeometry in
+                        Color.clear.preference(
+                            key: ReaderVerticalPageTopsKey.self,
+                            value: [
+                                id: pageGeometry
+                                    .frame(in: .named("verticalReader"))
+                                    .minY
+                            ]
+                        )
+                    }
+                }
+        case let .chapterBreak(chapterId):
+            if let section = sections.first(where: { $0.chapterId == chapterId }) {
+                chapterBreak(after: section)
+            }
+        }
+    }
+
+    /// The page whose top edge most recently crossed the viewport's top edge. Only
+    /// bookkeeping changes here; the model follows after the scroll pauses.
+    private func trackVerticalPage(_ tops: [ReaderPageID: CGFloat]) {
+        guard !isMagnifying,
+              !verticalScrollTracker.isRestoring,
+              !tops.isEmpty
+        else { return }
 
         let visible = tops
             .filter { $0.value <= 1 }
             .max { $0.value < $1.value }
             ?? tops.min { $0.value < $1.value }
 
-        guard let index = visible?.key else { return }
-        verticalScrollTracker.topPageIndex = index
+        guard let id = visible?.key, id != verticalScrollTracker.topPageID else { return }
+        verticalScrollTracker.topPageID = id
+        scheduleTrackedVerticalPageApply()
+    }
+
+    /// A fallback for scroll widgets that do not report phases: if the page under the
+    /// top edge stops changing for a moment, the model catches up even without an
+    /// `idle` event.
+    private func scheduleTrackedVerticalPageApply() {
+        verticalScrollTracker.applyTask?.cancel()
+        verticalScrollTracker.applyTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            applyTrackedVerticalPage()
+        }
     }
 
     private func applyTrackedVerticalPage() {
-        guard let index = verticalScrollTracker.topPageIndex,
-              index != model.currentIndex
+        verticalScrollTracker.applyTask?.cancel()
+        verticalScrollTracker.applyTask = nil
+
+        guard !verticalScrollTracker.isUserScrolling,
+              !verticalScrollTracker.isRestoring,
+              !isMagnifying,
+              let id = verticalScrollTracker.topPageID,
+              let section = sections.first(where: { $0.chapterId == id.chapterId }),
+              let pagePosition = section.pages.firstIndex(where: { $0.index == id.pageIndex }),
+              let chapterIndex = model.chapters.firstIndex(where: { $0.chapterId == id.chapterId })
         else { return }
 
-        verticalScrollTracker.lastAppliedIndex = index
-        model.goToPage(index, resetZoom: false)
+        if id.chapterId == sections.last?.chapterId {
+            loadNextSectionIfNeeded()
+        }
+
+        guard id.chapterId != model.chapter.chapterId
+                || pagePosition != model.currentIndex
+        else { return }
+
+        // Moving forward through a break finishes the episode being left, even when
+        // the gesture crossed it too fast for an idle page update.
+        if chapterIndex > model.currentChapterIndex {
+            for index in model.currentChapterIndex..<chapterIndex {
+                model.markChapterRead(at: index)
+            }
+        }
+
+        verticalScrollTracker.lastAppliedPageID = id
+        verticalScrollTracker.isApplyingModelChange = true
+        model.enterChapter(
+            index: chapterIndex,
+            pages: section.pages,
+            pageIndex: pagePosition
+        )
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(60))
+            verticalScrollTracker.isApplyingModelChange = false
+        }
+    }
+
+    /// Scrolls once the new page ids are in the view tree. Used for restores and
+    /// explicit jumps, never for a page the user scrolled to.
+    private func performPendingScroll(_ proxy: ScrollViewProxy) {
+        guard let id = pendingScrollPageID else { return }
+        pendingScrollPageID = nil
+        // Geometry writes while the view is being repositioned are not page turns.
+        verticalScrollTracker.applyTask?.cancel()
+        verticalScrollTracker.isRestoring = true
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(50))
+            // If another action moved the model while this was waiting, follow the
+            // latest page instead of snapping back to the old request.
+            if !verticalScrollTracker.isUserScrolling {
+                let target = currentVerticalPageID ?? id
+                proxy.scrollTo(target, anchor: .top)
+            }
+            try? await Task.sleep(for: .milliseconds(80))
+            verticalScrollTracker.isRestoring = false
+            verticalScrollTracker.isApplyingModelChange = false
+        }
+    }
+
+    private var currentVerticalPageID: ReaderPageID? {
+        guard model.pages.indices.contains(model.currentIndex) else { return nil }
+        return ReaderPageID(
+            chapterId: model.chapter.chapterId,
+            pageIndex: model.pages[model.currentIndex].index
+        )
+    }
+
+    /// Brings the stream in line with the model.
+    ///
+    /// A chapter loaded from outside the stream (the picker, a chapter shortcut, a
+    /// retry) starts a new stream. A chapter the model entered by scrolling is already
+    /// in `sections`, so this leaves every loaded page — and the scroll position — in
+    /// place.
+    private func syncSectionsFromModel() {
+        guard !model.pages.isEmpty else { return }
+
+        let chapterId = model.chapter.chapterId
+        if let existing = sections.first(where: { $0.chapterId == chapterId }),
+           existing.pages == model.pages {
+            if settings.layout == .vertical,
+               !verticalScrollTracker.isUserScrolling,
+               !verticalScrollTracker.isApplyingModelChange,
+               let id = currentVerticalPageID,
+               id != verticalScrollTracker.lastAppliedPageID {
+                verticalScrollTracker.topPageID = id
+                verticalScrollTracker.lastAppliedPageID = id
+                verticalScrollTracker.isRestoring = true
+                pendingScrollPageID = id
+            }
+            // Only extend the stream when the reader is at its growing end. Doing
+            // this on every chapter change would load a new episode each time the
+            // reader scrolled back and forth.
+            if chapterId == sections.last?.chapterId {
+                loadNextSectionIfNeeded()
+            }
+            return
+        }
+
+        sections = [
+            ReaderSection(chapterId: chapterId, pages: model.pages)
+        ]
+        verticalScrollTracker.streamGeneration &+= 1
+        verticalScrollTracker.isApplyingModelChange = false
+        loadingSectionID = nil
+        failedSectionID = nil
+
+        if settings.layout == .vertical, let id = currentVerticalPageID {
+            verticalScrollTracker.topPageID = id
+            verticalScrollTracker.lastAppliedPageID = id
+            verticalScrollTracker.isRestoring = true
+            pendingScrollPageID = id
+        }
+        loadNextSectionIfNeeded()
+    }
+
+    /// Loads one episode after the end of the stream. It is fetched as soon as the
+    /// current chapter is in place, so the pages are already there by the time the
+    /// reader scrolls across the break. When the reader actually enters that episode,
+    /// the one after it starts loading.
+    private func loadNextSectionIfNeeded() {
+        guard loadingSectionID == nil,
+              let last = sections.last,
+              let lastChapterIndex = model.chapters.firstIndex(where: {
+                  $0.chapterId == last.chapterId
+              }),
+              model.chapters.indices.contains(lastChapterIndex + 1)
+        else { return }
+
+        let nextChapter = model.chapters[lastChapterIndex + 1]
+        guard failedSectionID != nextChapter.chapterId else { return }
+
+        // A late result from a stream that has since been replaced is discarded.
+        let generation = verticalScrollTracker.streamGeneration
+        loadingSectionID = nextChapter.chapterId
+
+        Task { @MainActor in
+            // Resolve by id, not by the index captured above: fetching the chapter
+            // list can renumber the list while this request is in flight.
+            let pages = await model.loadPages(forChapterId: nextChapter.chapterId)
+            guard generation == verticalScrollTracker.streamGeneration else { return }
+            guard sections.last?.chapterId == last.chapterId else {
+                loadingSectionID = nil
+                return
+            }
+
+            if let pages, !pages.isEmpty {
+                sections.append(
+                    ReaderSection(chapterId: nextChapter.chapterId, pages: pages)
+                )
+                model.prefetchFirstPages(of: pages)
+            } else {
+                failedSectionID = nextChapter.chapterId
+            }
+            loadingSectionID = nil
+        }
+    }
+
+    /// The visible boundary between episodes. Its height is fixed so a spinner, an
+    /// error or the next chapter's title cannot change the document's height while
+    /// the reader is moving through it.
+    @ViewBuilder
+    private func chapterBreak(after section: ReaderSection) -> some View {
+        let sectionChapter = model.chapters.first { $0.chapterId == section.chapterId }
+        let sectionIndex = sectionChapter.flatMap { chapter in
+            model.chapters.firstIndex { $0.chapterId == chapter.chapterId }
+        }
+        let nextChapter = sectionIndex.flatMap { index in
+            model.chapters.indices.contains(index + 1) ? model.chapters[index + 1] : nil
+        }
+        let isLoading = nextChapter.map { loadingSectionID == $0.chapterId } ?? false
+        let failed = nextChapter.map { failedSectionID == $0.chapterId } ?? false
+
+        VStack(spacing: 12) {
+            Rectangle()
+                .fill(.secondary.opacity(0.25))
+                .frame(width: 56, height: 1)
+
+            Text("END OF CHAPTER")
+                .font(.caption2.weight(.semibold))
+                .tracking(1.8)
+                .foregroundStyle(.tertiary)
+
+            Text(sectionChapter?.displayName ?? "Chapter")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+
+            if let nextChapter {
+                VStack(spacing: 5) {
+                    Text("NEXT CHAPTER")
+                        .font(.caption2)
+                        .tracking(1.4)
+                        .foregroundStyle(.tertiary)
+                    Text(nextChapter.displayName)
+                        .font(.headline)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.top, 10)
+
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if let externalURL = nextChapter.externalURL {
+                    Link("Open on Source Site", destination: externalURL)
+                        .font(.caption)
+                } else if failed {
+                    Button("Try Loading Again") {
+                        failedSectionID = nil
+                        loadNextSectionIfNeeded()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .font(.caption)
+                }
+            } else {
+                Text("You're all caught up")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 10)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 230)
+        .padding(.horizontal, 24)
     }
 
     /// Horizontal paging is the platform's scroll view with one custom decision about
@@ -677,16 +995,17 @@ struct ReaderView: View {
     /// the desktop swipe does — across as many of them as the gesture covers.
     /// `ReaderPagingBehavior` then settles on whichever page the fingers were nearest to
     /// rather than following the momentum, so a fast swipe lands where it was aimed
-    /// instead of sailing past pages that were never read.
+    /// instead of sailing past pages that were never read. Loaded chapters are laid out
+    /// in the same row with a full-window break between them.
     private var horizontalReader: some View {
         GeometryReader { geometry in
             let size = geometry.size
             ScrollView(.horizontal) {
                 LazyHStack(spacing: 0) {
-                    ForEach(Array(spreads.enumerated()), id: \.offset) { _, spread in
-                        spreadView(spread, size: size)
+                    ForEach(horizontalItems) { item in
+                        horizontalItemView(item, size: size)
                             .frame(width: size.width, height: size.height)
-                            .id(spread.first?.index ?? 0)
+                            .id(item.id)
                     }
                 }
                 .scrollTargetLayout()
@@ -709,44 +1028,306 @@ struct ReaderView: View {
             } action: { _, offset in
                 scrollOffset.value = offset
             }
-            .onAppear { spreadPosition = spreadID(at: currentSpreadIndex) }
-            .onChange(of: spreadPosition) { _, newValue in
-                guard let newValue, newValue != spreadID(at: currentSpreadIndex) else { return }
-                model.goToPage(newValue)
+            .onScrollPhaseChange { oldPhase, phase in
+                verticalScrollTracker.isHorizontalScrolling = phase == .tracking
+                    || phase == .interacting
+                    || phase == .decelerating
+                // Settle the model on exactly where the gesture stopped. While the
+                // gesture is live the binding drives the model; nothing here moves
+                // the scroll view.
+                if oldPhase != .idle, phase == .idle {
+                    handleHorizontalPosition(spreadPosition)
+                }
             }
-            .onChange(of: model.currentIndex) { _, _ in
-                guard spreadID(at: currentSpreadIndex) != spreadPosition else { return }
-                withAnimation(ReaderView.pageTurnAnimation) { spreadPosition = spreadID(at: currentSpreadIndex) }
+            .onAppear {
+                verticalScrollTracker.isHorizontalScrolling = false
+                syncHorizontalPosition(animated: false)
+            }
+            .onChange(of: spreadPosition) { _, newValue in
+                handleHorizontalPosition(newValue)
+            }
+            .onChange(of: currentHorizontalItemID) { _, _ in
+                syncHorizontalPosition(animated: spreadPosition != nil)
+            }
+            .onChange(of: settings.pageMode) { _, _ in
+                syncHorizontalPosition(animated: true)
             }
         }
     }
 
-    /// Identity the scroll view is addressed by: the first page of a spread.
-    private func spreadID(at index: Int) -> Int? {
-        let grid = spreads
-        guard grid.indices.contains(index) else { return nil }
-        return grid[index].first?.index
+    /// Every spread of every loaded chapter, with the chapter break as its own
+    /// full-window page. A LazyHStack of these is the horizontal stream.
+    private var horizontalItems: [ReaderHorizontalItem] {
+        var items: [ReaderHorizontalItem] = []
+        for section in sections {
+            let grids = ReaderSpreads.group(
+                section.pages,
+                pageMode: settings.pageMode,
+                firstPageAlone: settings.doublePageFirstPageAlone
+            )
+            for grid in grids {
+                guard let first = grid.first else { continue }
+                items.append(
+                    ReaderHorizontalItem(
+                        id: .page(
+                            ReaderPageID(
+                                chapterId: section.chapterId,
+                                pageIndex: first.index
+                            )
+                        ),
+                        chapterId: section.chapterId,
+                        pages: grid,
+                        isBreak: false
+                    )
+                )
+            }
+            items.append(
+                ReaderHorizontalItem(
+                    id: .chapterBreak(section.chapterId),
+                    chapterId: section.chapterId,
+                    pages: [],
+                    isBreak: true
+                )
+            )
+        }
+        return items
+    }
+
+    @ViewBuilder
+    private func horizontalItemView(_ item: ReaderHorizontalItem, size: CGSize) -> some View {
+        if item.isBreak {
+            if let section = sections.first(where: { $0.chapterId == item.chapterId }) {
+                chapterBreak(after: section)
+            }
+        } else {
+            spreadView(item.pages, size: size)
+        }
+    }
+
+    /// The spread containing the model's current page, as an item identity.
+    private var currentHorizontalItemID: ReaderStreamItemID? {
+        guard let section = sections.first(where: {
+            $0.chapterId == model.chapter.chapterId
+        }) else { return nil }
+
+        let grids = ReaderSpreads.group(
+            section.pages,
+            pageMode: settings.pageMode,
+            firstPageAlone: settings.doublePageFirstPageAlone
+        )
+        guard let index = ReaderSpreads.spreadIndex(showing: model.currentIndex, in: grids),
+              let first = grids[index].first
+        else { return nil }
+
+        return .page(
+            ReaderPageID(chapterId: section.chapterId, pageIndex: first.index)
+        )
+    }
+
+    private func syncHorizontalPosition(animated: Bool) {
+        guard !verticalScrollTracker.isHorizontalScrolling,
+              let id = currentHorizontalItemID,
+              id != spreadPosition
+        else { return }
+        if animated {
+            withAnimation(ReaderView.pageTurnAnimation) {
+                spreadPosition = id
+            }
+        } else {
+            spreadPosition = id
+        }
+    }
+
+    /// A horizontal gesture landed on a spread or a break. Breaks only exist to get
+    /// the next episode fetching; spreads move the model to the chapter they belong
+    /// to without touching the loaded sections or the scroll position.
+    private func handleHorizontalPosition(_ id: ReaderStreamItemID?) {
+        guard let id else { return }
+
+        switch id {
+        case let .chapterBreak(chapterId):
+            if sections.last?.chapterId == chapterId {
+                loadNextSectionIfNeeded()
+            }
+        case let .page(pageID):
+            // A double-page spread is addressed by its first page. If the model is
+            // already showing this spread, keep the exact page inside it (the saved
+            // page may be the right-hand one).
+            guard id != currentHorizontalItemID,
+                  let section = sections.first(where: { $0.chapterId == pageID.chapterId }),
+                  let pagePosition = section.pages.firstIndex(where: {
+                      $0.index == pageID.pageIndex
+                  }),
+                  let chapterIndex = model.chapters.firstIndex(where: {
+                      $0.chapterId == pageID.chapterId
+                  })
+            else { return }
+
+            if pageID.chapterId != model.chapter.chapterId
+                || pagePosition != model.currentIndex {
+                // Moving forward off the final spread finishes the chapter being
+                // left. A chapter-control jump from the middle is not a read.
+                if chapterIndex > model.currentChapterIndex,
+                   isCurrentChapterOnLastSpread {
+                    for index in model.currentChapterIndex..<chapterIndex {
+                        model.markChapterRead(at: index)
+                    }
+                }
+                model.enterChapter(
+                    index: chapterIndex,
+                    pages: section.pages,
+                    pageIndex: pagePosition
+                )
+                // Horizontal paging has always returned to fit on a page turn.
+                model.resetZoom()
+            }
+        }
+    }
+
+    /// Whether the model's current page is anywhere in the chapter's final spread.
+    private var isCurrentChapterOnLastSpread: Bool {
+        let grids = ReaderSpreads.group(
+            model.pages,
+            pageMode: settings.pageMode,
+            firstPageAlone: settings.doublePageFirstPageAlone
+        )
+        guard let last = grids.last else { return false }
+        return last.contains { $0.index == model.currentIndex }
     }
 
     /// Deliberate page turn: one spread, which is one page in single-page mode and a
     /// facing pair in double-page mode.
     private func turnSpread(_ direction: Int) {
         guard settings.layout == .horizontal else {
-            direction > 0 ? model.nextPage() : model.previousPage()
+            turnVerticalPage(direction)
             return
         }
 
         // A reading-order step, which right to left reverses.
         let step = settings.direction == .rightToLeft ? -direction : direction
-        let neighbour = currentSpreadIndex + step
-        guard spreads.indices.contains(neighbour), let firstPage = spreads[neighbour].first else {
-            // At the end of the chapter, keep the existing behaviour of moving on.
-            direction > 0 ? model.nextPage() : model.previousPage()
-            return
+        let items = horizontalItems
+        let start = items.firstIndex { $0.id == spreadPosition }
+            ?? items.firstIndex { $0.id == currentHorizontalItemID }
+        guard let start else { return }
+
+        var index = start + step
+        while items.indices.contains(index) {
+            if !items[index].isBreak {
+                withAnimation(ReaderView.pageTurnAnimation) {
+                    spreadPosition = items[index].id
+                }
+                return
+            }
+            index += step
         }
 
+        // At the end of the loaded stream, load the adjacent chapter. The step
+        // already accounts for right-to-left, so use it rather than the arrow.
+        step > 0 ? model.nextPage() : model.previousPage()
+    }
+
+    /// A keyboard page turn in the vertical stream. Inside a chapter this is an
+    /// ordinary page change. At a boundary it walks into the loaded episode rather
+    /// than reloading the chapter and dropping the stream.
+    private func turnVerticalPage(_ direction: Int) {
+        if direction > 0 {
+            if model.currentIndex + 1 < model.pages.count {
+                model.goToPage(model.currentIndex + 1)
+            } else if let next = adjacentSection(direction: 1) {
+                enterContinuousSection(next, page: 0)
+            } else {
+                model.nextPage()
+            }
+        } else {
+            if model.currentIndex > 0 {
+                model.goToPage(model.currentIndex - 1)
+            } else if let previous = adjacentSection(direction: -1) {
+                enterContinuousSection(previous, page: max(0, previous.pages.count - 1))
+            } else {
+                model.previousPage()
+            }
+        }
+    }
+
+    /// The loaded section for the chapter immediately before or after the current
+    /// one, if it has been fetched.
+    private func adjacentSection(direction: Int) -> ReaderSection? {
+        let targetIndex = model.currentChapterIndex + direction
+        guard model.chapters.indices.contains(targetIndex) else { return nil }
+        let chapterId = model.chapters[targetIndex].chapterId
+        return sections.first { $0.chapterId == chapterId }
+    }
+
+    /// Moves the model to an already-loaded episode and scrolls its first (or last)
+    /// page into view. The scroll request, not a re-anchored scroll position, is what
+    /// moves the viewport.
+    private func enterContinuousSection(_ section: ReaderSection, page: Int) {
+        guard !section.pages.isEmpty,
+              let chapterIndex = model.chapters.firstIndex(where: {
+                  $0.chapterId == section.chapterId
+              })
+        else { return }
+
+        let index = min(max(0, page), section.pages.count - 1)
+        let id = ReaderPageID(
+            chapterId: section.chapterId,
+            pageIndex: section.pages[index].index
+        )
+
+        verticalScrollTracker.topPageID = id
+        verticalScrollTracker.lastAppliedPageID = id
+        verticalScrollTracker.isRestoring = true
+        verticalScrollTracker.isApplyingModelChange = true
+        model.enterChapter(
+            index: chapterIndex,
+            pages: section.pages,
+            pageIndex: index
+        )
+        pendingScrollPageID = id
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(60))
+            verticalScrollTracker.isApplyingModelChange = false
+        }
+    }
+
+    /// A chapter step from the controls or `[`/`]`. If the episode is already in the
+    /// stream, walk to it; otherwise load it as a fresh stream.
+    private func goToAdjacentChapter(_ direction: Int) {
+        let targetIndex = model.currentChapterIndex + direction
+        guard model.chapters.indices.contains(targetIndex) else { return }
+        let targetChapterId = model.chapters[targetIndex].chapterId
+
+        if let section = sections.first(where: { $0.chapterId == targetChapterId }) {
+            if settings.layout == .vertical {
+                enterContinuousSection(
+                    section,
+                    page: direction > 0 ? 0 : max(0, section.pages.count - 1)
+                )
+            } else {
+                goToSectionInHorizontal(section, atStart: direction > 0)
+            }
+        } else {
+            Task { await model.goToChapter(index: targetIndex) }
+        }
+    }
+
+    /// Jumps the horizontal scroll view to the first or last spread of a loaded
+    /// chapter. The binding's change handler brings the model along.
+    private func goToSectionInHorizontal(_ section: ReaderSection, atStart: Bool) {
+        let grids = ReaderSpreads.group(
+            section.pages,
+            pageMode: settings.pageMode,
+            firstPageAlone: settings.doublePageFirstPageAlone
+        )
+        guard let pages = (atStart ? grids.first : grids.last),
+              let first = pages.first
+        else { return }
+
         withAnimation(ReaderView.pageTurnAnimation) {
-            spreadPosition = firstPage.index
+            spreadPosition = .page(
+                ReaderPageID(chapterId: section.chapterId, pageIndex: first.index)
+            )
         }
     }
 
@@ -868,7 +1449,7 @@ struct ReaderView: View {
             if !model.pages.isEmpty {
                 HStack(spacing: 12) {
                     Button {
-                        Task { await model.goToChapter(index: model.currentChapterIndex - 1) }
+                        goToAdjacentChapter(-1)
                     } label: {
                         Image(systemName: "backward.end.fill")
                     }
@@ -929,7 +1510,7 @@ struct ReaderView: View {
                     }
 
                     Button {
-                        Task { await model.goToChapter(index: model.currentChapterIndex + 1) }
+                        goToAdjacentChapter(1)
                     } label: {
                         Image(systemName: "forward.end.fill")
                     }
@@ -1088,7 +1669,7 @@ struct ReaderView: View {
     @ViewBuilder
     private var chapterControls: some View {
         Button {
-            Task { await model.goToChapter(index: model.currentChapterIndex - 1) }
+            goToAdjacentChapter(-1)
         } label: {
             Label("Previous Chapter", systemImage: "chevron.left")
         }
@@ -1103,7 +1684,7 @@ struct ReaderView: View {
         .help("Chapters")
 
         Button {
-            Task { await model.goToChapter(index: model.currentChapterIndex + 1) }
+            goToAdjacentChapter(1)
         } label: {
             Label("Next Chapter", systemImage: "chevron.right")
         }
@@ -1593,19 +2174,78 @@ private struct ReaderResizeGrip: NSViewRepresentable {
 
 /// Vertical reader page tracking that does not invalidate the view when it changes.
 private final class ReaderVerticalScrollTracker {
-    var topPageIndex: Int?
-    var lastAppliedIndex: Int?
+    var topPageID: ReaderPageID?
+    var lastAppliedPageID: ReaderPageID?
     var isUserScrolling = false
+    /// True while the horizontal pager is tracking the user's fingers.
+    var isHorizontalScrolling = false
+    /// True while the model is being moved across a chapter boundary by scrolling,
+    /// so the resulting page change is not mistaken for an explicit jump.
+    var isApplyingModelChange = false
+    /// True while the scroll view is being moved to a requested page by the reader,
+    /// so the pages passing under the viewport are not mistaken for user scrolling.
+    var isRestoring = false
+    /// Identifies the current stream. A late page fetch from a stream that has been
+    /// replaced is discarded rather than appended to the new one.
+    var streamGeneration = 0
+    var applyTask: Task<Void, Never>?
 }
 
 /// The top edge of every realized page in the vertical reader, in the scroll view's
 /// coordinate space.
 private struct ReaderVerticalPageTopsKey: PreferenceKey {
-    static var defaultValue: [Int: CGFloat] = [:]
+    static var defaultValue: [ReaderPageID: CGFloat] = [:]
 
-    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+    static func reduce(value: inout [ReaderPageID: CGFloat], nextValue: () -> [ReaderPageID: CGFloat]) {
         value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
+}
+
+/// Identity of a page in the reading stream. Chapters are identified by their stable
+/// id rather than their position in the chapter list, so a chapter list that arrives
+/// after the reader opens can never renumber pages that are already on screen.
+private struct ReaderPageID: Hashable {
+    let chapterId: String
+    let pageIndex: Int
+}
+
+/// Identity of any view in the stream: a page/spread or the break after a chapter.
+/// Used by the horizontal scroll position as well as the vertical page tracking.
+private enum ReaderStreamItemID: Hashable {
+    case page(ReaderPageID)
+    case chapterBreak(String)
+}
+
+/// One chapter loaded into the continuous stream.
+private struct ReaderSection: Identifiable {
+    let chapterId: String
+    let pages: [Page]
+
+    var id: String { chapterId }
+}
+
+/// A lazy row in the vertical stream: one page, or the break after a chapter.
+private enum ReaderVerticalItem: Identifiable {
+    case page(chapterId: String, page: Page)
+    case chapterBreak(chapterId: String)
+
+    var id: ReaderStreamItemID {
+        switch self {
+        case let .page(chapterId, page):
+            .page(ReaderPageID(chapterId: chapterId, pageIndex: page.index))
+        case let .chapterBreak(chapterId):
+            .chapterBreak(chapterId)
+        }
+    }
+}
+
+/// One full-window item in the horizontal stream: a spread, or the break after a
+/// chapter.
+private struct ReaderHorizontalItem: Identifiable {
+    let id: ReaderStreamItemID
+    let chapterId: String
+    let pages: [Page]
+    let isBreak: Bool
 }
 
 /// A point on the page, the matching point in the viewport, and the zoom it was

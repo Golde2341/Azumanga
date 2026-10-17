@@ -27,7 +27,12 @@ private actor PageSource: MangaSource {
         Manga(sourceId: id, mangaId: id, title: "Test")
     }
 
-    func chapters(mangaId: String) async throws -> [Chapter] { [] }
+    func chapters(mangaId: String) async throws -> [Chapter] {
+        [
+            Chapter(sourceId: id, mangaId: mangaId, chapterId: "c1", number: 1),
+            Chapter(sourceId: id, mangaId: mangaId, chapterId: "c2", number: 2),
+        ]
+    }
 
     func pages(chapterId: String) async throws -> [Page] {
         requestedChapters.append(chapterId)
@@ -220,7 +225,7 @@ struct ReaderModelTests {
         #expect(model.isExternallyHosted)
     }
 
-    @Test("Zoom is clamped between 1x and 5x")
+    @Test("Zoom is clamped between 0.5x and 5x")
     func zoomClamping() async throws {
         let (services, container) = try makeServices()
         _ = container
@@ -234,13 +239,98 @@ struct ReaderModelTests {
             settings: makeSettings()
         )
         model.setZoom(0.2)
-        #expect(model.zoom == 1)
+        #expect(model.zoom == 0.5)
         model.setZoom(9)
         #expect(model.zoom == 5)
         model.zoomIn()
         #expect(model.zoom == 5)
         model.resetZoom()
         #expect(model.zoom == 1)
+    }
+
+    @Test("A reader opened without chapters resolves the series in the background")
+    func loadsChapterListForDirectOpen() async throws {
+        let (services, container) = try makeServices()
+        _ = container
+        await services.registry.register(PageSource(pageCount: 4))
+
+        let model = ReaderModel(
+            manga: sampleManga(),
+            chapters: [],
+            startChapterId: "c1",
+            services: services,
+            settings: makeSettings()
+        )
+        await model.load()
+
+        var attempts = 0
+        while model.chapterCount < 2, attempts < 100 {
+            try? await Task.sleep(for: .milliseconds(10))
+            attempts += 1
+        }
+
+        #expect(model.chapterCount == 2)
+        #expect(model.currentChapterIndex == 0)
+        #expect(model.hasNextChapter)
+        #expect(model.pages.count == 4)
+    }
+
+    @Test("Loads the next chapter without leaving the current one")
+    func loadsNeighbouringPages() async throws {
+        let (services, container) = try makeServices()
+        _ = container
+        let source = PageSource(pageCount: 4)
+        await services.registry.register(source)
+
+        let model = ReaderModel(
+            manga: sampleManga(),
+            chapters: chapters(),
+            startChapterId: "c1",
+            services: services,
+            settings: makeSettings()
+        )
+        await model.load()
+
+        let next = await model.loadPages(forChapterAt: 1)
+        #expect(next?.count == 4)
+        #expect(model.chapter.chapterId == "c1")
+        #expect(model.currentChapterIndex == 0)
+        #expect(await source.requested == ["c1", "c2"])
+    }
+
+    @Test("Entering a loaded chapter keeps the stream and saves the old progress")
+    func entersLoadedChapter() async throws {
+        let (services, container) = try makeServices()
+        _ = container
+        let source = PageSource(pageCount: 5)
+        await services.registry.register(source)
+
+        let model = ReaderModel(
+            manga: sampleManga(),
+            chapters: chapters(),
+            startChapterId: "c1",
+            services: services,
+            settings: makeSettings()
+        )
+        await model.load()
+        model.goToPage(3)
+
+        let next = await model.loadPages(forChapterAt: 1)
+        #expect(next?.count == 5)
+        model.enterChapter(index: 1, pages: next!, pageIndex: 1)
+
+        #expect(model.chapter.chapterId == "c2")
+        #expect(model.currentChapterIndex == 1)
+        #expect(model.currentIndex == 1)
+        #expect(model.pages == next)
+        #expect(await source.requested == ["c1", "c2"])
+
+        let previous = try services.progressStore.record(
+            sourceId: "test.pages",
+            mangaId: "m1",
+            chapterId: "c1"
+        )
+        #expect(previous?.lastPageIndex == 3)
     }
 
     @Test("Missing source reports an error rather than crashing")

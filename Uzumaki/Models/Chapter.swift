@@ -65,4 +65,17 @@ nonisolated struct Chapter: Identifiable, Hashable, Sendable, Codable {
         self.isRead = isRead
         self.isBookmarked = isBookmarked
     }
+
+    /// Oldest first, with unnumbered entries last. This is the order used by the
+    /// detail screen and by the reader's next/previous chapter navigation.
+    static func readingOrder(_ chapters: [Chapter]) -> [Chapter] {
+        chapters.sorted { lhs, rhs in
+            switch (lhs.number, rhs.number) {
+            case let (l?, r?): l < r
+            case (nil, nil): false
+            case (nil, _): false
+            case (_, nil): true
+            }
+        }
+    }
 }

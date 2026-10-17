@@ -94,8 +94,9 @@ struct DownloadsView: View {
     }
 
     private func session(for record: DownloadRecord) -> ReaderSession {
-        // Opening with no chapter list keeps this fully offline: the reader
-        // serves the downloaded pages without contacting the source.
+        // Opening with no chapter list lets the reader serve the downloaded pages
+        // immediately. It resolves the rest of the series in the background so
+        // chapter navigation works when the source is reachable.
         ReaderSession(
             manga: Manga(
                 sourceId: record.sourceId,

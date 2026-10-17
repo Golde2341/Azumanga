@@ -56,14 +56,7 @@ final class MangaDetailModel {
 
     /// Chapters presented oldest-first, with unnumbered entries last.
     func ordered(_ chapters: [Chapter]) -> [Chapter] {
-        chapters.sorted { lhs, rhs in
-            switch (lhs.number, rhs.number) {
-            case let (l?, r?): l < r
-            case (nil, nil): false
-            case (nil, _): false
-            case (_, nil): true
-            }
-        }
+        Chapter.readingOrder(chapters)
     }
 
     /// Where "Continue reading" should open, given the saved library pointer.

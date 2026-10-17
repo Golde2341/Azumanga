@@ -36,6 +36,11 @@ final class ReaderModel {
     private let services: Services
     private let settings: SettingsStore
     private let startPageIndex: Int?
+    /// True when the reader was opened without a chapter list (library Force Touch,
+    /// bookmarks, Downloads). The list is fetched in the background so next/previous
+    /// chapters and continuous reading work without delaying the pages.
+    private let needsChapterList: Bool
+    private var hasRequestedChapterList = false
     private var saveTask: Task<Void, Never>?
 
     init(
@@ -48,6 +53,7 @@ final class ReaderModel {
     ) {
         self.manga = manga
         self.startPageIndex = startPageIndex
+        self.needsChapterList = chapters.isEmpty
         if chapters.isEmpty {
             // Opened directly (for example from Downloads): rebuild what we know
             // about the chapter from the saved progress row.
@@ -105,6 +111,11 @@ final class ReaderModel {
         currentIndex = 0
         zoom = 1
 
+        // A reader opened from the library or a bookmark carries no chapter list.
+        // Fetch it alongside the pages so the next/previous controls and continuous
+        // reading have somewhere to go. Failure leaves the single known chapter.
+        startChapterListLoadIfNeeded()
+
         if isExternallyHosted {
             isLoading = false
             errorMessage = "This chapter is hosted on an external site and has no readable pages here."
@@ -139,17 +150,52 @@ final class ReaderModel {
         }
     }
 
+    /// Resolves the full chapter list for a reader opened without one, without
+    /// delaying the pages. When it arrives, the model's chapter index is moved to the
+    /// chapter being read, which enables next/previous and the continuous stream.
+    private func startChapterListLoadIfNeeded() {
+        guard needsChapterList, !hasRequestedChapterList else { return }
+        hasRequestedChapterList = true
+
+        let startingChapterId = chapter.chapterId
+        Task { [weak self] in
+            await self?.loadChapterList(startingAt: startingChapterId)
+        }
+    }
+
+    private func loadChapterList(startingAt chapterId: String) async {
+        guard let source = await services.registry.source(id: manga.sourceId) else { return }
+        guard let fetched = try? await source.chapters(mangaId: manga.mangaId),
+              !fetched.isEmpty
+        else { return }
+
+        let ordered = Chapter.readingOrder(fetched)
+        guard let index = ordered.firstIndex(where: { $0.chapterId == chapterId }),
+              chapter.chapterId == chapterId
+        else { return }
+
+        // Move the index before publishing the list: `chapter` clamps to the old
+        // single-chapter array in between, so the chapter being read never changes
+        // identity while the view is observing the update.
+        currentChapterIndex = index
+        chapters = ordered
+    }
+
     private func downloadedPages() async -> [Page]? {
+        await downloadedPages(for: chapter)
+    }
+
+    private func downloadedPages(for chapter: Chapter) async -> [Page]? {
         let record = try? services.downloadStore.record(
             sourceId: manga.sourceId,
             mangaId: manga.mangaId,
             chapterId: chapter.chapterId
         )
         guard record?.state == .completed else { return nil }
-        return await services.downloads.localPages(job)
+        return await services.downloads.localPages(job(for: chapter))
     }
 
-    var job: DownloadJob {
+    private func job(for chapter: Chapter) -> DownloadJob {
         DownloadJob(
             sourceId: manga.sourceId,
             mangaId: manga.mangaId,
@@ -158,6 +204,47 @@ final class ReaderModel {
             chapterTitle: chapter.title,
             chapterNumber: chapter.number
         )
+    }
+
+    var job: DownloadJob { job(for: chapter) }
+
+    /// Resolves a chapter's pages without making it current. The continuous vertical
+    /// reader uses this to put the next episode below the one being read.
+    func loadPages(forChapterAt index: Int) async -> [Page]? {
+        guard chapters.indices.contains(index) else { return nil }
+        return await loadPages(forChapterId: chapters[index].chapterId)
+    }
+
+    /// Resolves a chapter by id so a caller holding a stable chapter id is not
+    /// affected by the chapter list arriving or being reordered mid-fetch.
+    func loadPages(forChapterId chapterId: String) async -> [Page]? {
+        guard let chapter = chapters.first(where: { $0.chapterId == chapterId }),
+              chapter.externalURL == nil
+        else { return nil }
+
+        if let downloaded = await downloadedPages(for: chapter), !downloaded.isEmpty {
+            return downloaded
+        }
+        guard let source = await services.registry.source(id: manga.sourceId) else { return nil }
+        return try? await source.pages(chapterId: chapter.chapterId)
+    }
+
+    /// Makes an already-loaded chapter current, without reloading or touching the
+    /// scroll position. Called as the continuous reader crosses a chapter boundary.
+    func enterChapter(index: Int, pages: [Page], pageIndex: Int) {
+        guard chapters.indices.contains(index), !pages.isEmpty else { return }
+
+        if index != currentChapterIndex || self.pages != pages {
+            // Save where the previous episode was left before its state is replaced.
+            flushProgress()
+        }
+        currentChapterIndex = index
+        if self.pages != pages {
+            self.pages = pages
+        }
+        currentIndex = min(max(0, pageIndex), pages.count - 1)
+        scheduleSave()
+        prefetchAhead()
     }
 
     private func restoreProgress() {
@@ -267,6 +354,15 @@ final class ReaderModel {
         Task { await services.images.prefetch(urls: urls, maxPixelSize: size) }
     }
 
+    /// Warms the opening pages of an episode that was appended to the continuous
+    /// reader, so crossing the break does not land on a placeholder.
+    func prefetchFirstPages(of pages: [Page], count: Int = 2) {
+        guard !pages.isEmpty else { return }
+        let urls = pages.prefix(max(1, count)).map(\.url)
+        let size = renderMaxPixelSize
+        Task { await services.images.prefetch(urls: urls, maxPixelSize: size) }
+    }
+
     // MARK: - Progress
 
     private func scheduleSave() {
@@ -310,6 +406,14 @@ final class ReaderModel {
 
     func markCurrentChapterRead() {
         try? services.progressStore.markRead(chapter)
+    }
+
+    /// Marks a chapter finished while the continuous reader crosses it. The previous
+    /// chapter's page progress is flushed separately, so an episode read through the
+    /// scroll stream still ends up completed.
+    func markChapterRead(at index: Int) {
+        guard chapters.indices.contains(index) else { return }
+        try? services.progressStore.markRead(chapters[index])
     }
 
     func markCurrentChapterUnread() {
