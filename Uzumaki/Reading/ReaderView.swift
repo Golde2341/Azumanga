@@ -57,6 +57,11 @@ struct ReaderView: View {
     /// Whether the reader is filling the screen in its own windowed mode. The reader
     /// keeps this alongside AppKit's native full screen; the two never overlap.
     @State private var isReaderFullScreen = false
+    /// True while the custom full-screen window is animating between its windowed
+    /// frame and the screen frame. Further full-screen toggles wait for it to settle.
+    @State private var isFullScreenAnimating = false
+    /// Invalidates a custom full-screen animation if native full screen takes over.
+    @State private var fullScreenState = ReaderFullScreenState()
     /// Whether AppKit's own full screen is active.
     @State private var isNativeFullScreen = false
     /// Whether AppKit is mid-transition into or out of native full screen. Window chrome
@@ -340,14 +345,16 @@ struct ReaderView: View {
         }
         // Native full screen is tracked separately from the reader's own screen-filling
         // mode. Nothing is done to the window from `will…` until the transition has
-        // unwound, so AppKit never has to reconcile the reader while it is capturing
-        // and restoring the window.
+        // unwound, except dropping any leftover exclusive-full-screen state: AppKit
+        // cannot transition a window that still has the temporary subclass, high
+        // level and pinned frame from that mode.
         .task(id: window) {
             guard let window else { return }
             for await _ in NotificationCenter.default.notifications(
                 named: NSWindow.willEnterFullScreenNotification,
                 object: window
             ) {
+                abandonCustomFullScreenIfNeeded(window)
                 beginNativeFullScreenTransition()
             }
         }
@@ -445,7 +452,14 @@ struct ReaderView: View {
     /// and the system's presentation options change. There is no space transition and
     /// no title bar swap, which is what avoids the native full screen exit hang.
     private func enterReaderFullScreen(_ window: NSWindow) {
-        guard !isReaderFullScreen, let screen = window.screen ?? NSScreen.main else { return }
+        guard !isReaderFullScreen,
+              !isFullScreenAnimating,
+              let screen = window.screen ?? NSScreen.main
+        else { return }
+
+        isFullScreenAnimating = true
+        fullScreenState.generation &+= 1
+        let generation = fullScreenState.generation
         windowedFrame = window.frame
         windowedSizeLimits = (window.minSize, window.maxSize)
         windowedLevel = window.level
@@ -457,59 +471,166 @@ struct ReaderView: View {
         // The page fills the screen; the grip that shapes the windowed reader is
         // not available there.
         appliedAspectRatio = 0
-        window.minSize = screen.frame.size
-        window.maxSize = screen.frame.size
 
         // Native full screen is not available while the reader is filling the screen
         // itself; the green button zooms instead. It comes back on exit.
         window.collectionBehavior.insert(.fullScreenNone)
         window.collectionBehavior.remove(.fullScreenPrimary)
 
-        if NSApp.isActive {
-            NSApp.presentationOptions = [.autoHideMenuBar, .autoHideDock]
-        }
         // A screen-filling window should not slide around under the pointer.
         window.isMovable = false
         // At normal level the menu bar draws over the window, leaving the page short
         // of the display's top edge. Sitting just above the menu bar makes the custom
         // full screen truly screen-filling: the page runs under the menu bar area and
-        // the camera housing. Raise the level before setting the frame so AppKit does
-        // not keep the window below the menu bar's edge.
+        // the camera housing.
         window.level = Self.readerFullScreenLevel
-        window.setFrame(screen.frame, display: true)
+
+        // Hide the reader's own full-screen chrome immediately (the traffic lights
+        // and resize grip). The menu bar and Dock stay put; the growing window covers
+        // them, and they are put into their full-screen state once it has arrived.
         reconcileWindow(window)
+
+        animateReaderWindow(window, to: screen.frame) {
+            guard generation == fullScreenState.generation else { return }
+            // Pin the limits only once the window has reached the screen size; while
+            // it is growing, the windowed limits must not fight the animation.
+            window.minSize = screen.frame.size
+            window.maxSize = screen.frame.size
+            // The window has covered the menu bar and Dock on its way up; put the
+            // system chrome into its full-screen state now, not before the animation.
+            if NSApp.isActive {
+                NSApp.presentationOptions = [.autoHideMenuBar, .autoHideDock]
+            }
+            isFullScreenAnimating = false
+            reconcileWindow(window)
+        }
     }
 
     /// Puts the window back where it was and hands the menu bar and Dock back.
     private func exitReaderFullScreen(_ window: NSWindow) {
-        guard isReaderFullScreen else { return }
-        isReaderFullScreen = false
-        settings.readerFullscreen = false
-        window.collectionBehavior.remove(.fullScreenNone)
-        window.collectionBehavior.insert(.fullScreenPrimary)
+        guard isReaderFullScreen, !isFullScreenAnimating else { return }
+        isFullScreenAnimating = true
+        fullScreenState.generation &+= 1
+        let generation = fullScreenState.generation
 
+        // Let the chrome come back behind the window before it starts shrinking; the
+        // window uncovers the menu bar and Dock as its top and bottom edges move in.
         if NSApp.isActive {
             NSApp.presentationOptions = savedPresentationOptions
         }
+
+        // Let the frame reach the smaller windowed size while it animates.
         if let windowedSizeLimits {
             window.minSize = windowedSizeLimits.min
             window.maxSize = windowedSizeLimits.max
             self.windowedSizeLimits = nil
         }
-        window.isMovable = true
-        if let windowedFrame {
-            window.setFrame(windowedFrame, display: true)
+
+        let destination = windowedFrame ?? window.frame
+        animateReaderWindow(window, to: destination) {
+            guard generation == fullScreenState.generation else { return }
+            isReaderFullScreen = false
+            settings.readerFullscreen = false
+            isFullScreenAnimating = false
+
+            window.collectionBehavior.remove(.fullScreenNone)
+            window.collectionBehavior.insert(.fullScreenPrimary)
+
+            window.isMovable = true
+
+            if let windowedClass {
+                ReaderFullScreenWindow.exit(window, originalClass: windowedClass)
+                self.windowedClass = nil
+            }
+            if let windowedLevel {
+                window.level = windowedLevel
+                self.windowedLevel = nil
+            }
             self.windowedFrame = nil
+            reconcileWindow(window)
         }
-        if let windowedClass {
-            ReaderFullScreenWindow.exit(window, originalClass: windowedClass)
-            self.windowedClass = nil
+    }
+
+    /// Drops the exclusive-full-screen state immediately when AppKit starts its own
+    /// full-screen transition.
+    ///
+    /// Native full screen must not inherit the custom mode's temporary window class,
+    /// high level, pinned frame or presentation options: AppKit's transition can hang
+    /// when it does. This is the safety net for a native transition started by a menu
+    /// command or shortcut while the custom mode is active or still animating. Normal
+    /// windowed entries find none of these markers and are untouched.
+    private func abandonCustomFullScreenIfNeeded(_ window: NSWindow) {
+        let currentClass: AnyClass = type(of: window)
+        let hasResidualClass = NSStringFromClass(currentClass)
+            .hasPrefix(ReaderFullScreenWindow.subclassPrefix)
+        let hasResidualLevel = window.level.rawValue > NSWindow.Level.mainMenu.rawValue
+
+        guard isReaderFullScreen
+                || isFullScreenAnimating
+                || windowedClass != nil
+                || windowedLevel != nil
+                || hasResidualClass
+                || hasResidualLevel
+        else { return }
+
+        fullScreenState.generation &+= 1
+        isFullScreenAnimating = false
+        isReaderFullScreen = false
+        settings.readerFullscreen = false
+
+        if NSApp.isActive {
+            NSApp.presentationOptions = savedPresentationOptions
         }
-        if let windowedLevel {
-            window.level = windowedLevel
-            self.windowedLevel = nil
+        if let limits = windowedSizeLimits {
+            window.minSize = limits.min
+            window.maxSize = limits.max
+            windowedSizeLimits = nil
         }
-        reconcileWindow(window)
+
+        window.isMovable = true
+        window.standardWindowButton(.zoomButton)?.isEnabled = true
+        window.collectionBehavior.remove(.fullScreenNone)
+        window.collectionBehavior.insert(.fullScreenPrimary)
+
+        if let originalClass = windowedClass {
+            ReaderFullScreenWindow.exit(window, originalClass: originalClass)
+        } else if hasResidualClass, let superclass = class_getSuperclass(currentClass) {
+            object_setClass(window, superclass)
+        }
+        windowedClass = nil
+
+        if let originalLevel = windowedLevel {
+            window.level = originalLevel
+        } else if hasResidualLevel {
+            window.level = .normal
+        }
+        windowedLevel = nil
+
+        // Leave the frame alone. AppKit is starting its own transition and owns the
+        // window now; whatever frame it captures is what native full screen restores.
+        windowedFrame = nil
+    }
+
+    /// Animates the reader's window frame. Reduce Motion falls back to an immediate
+    /// change; the completion still runs either way.
+    private func animateReaderWindow(
+        _ window: NSWindow,
+        to frame: NSRect,
+        completion: @escaping () -> Void
+    ) {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            window.setFrame(frame, display: true)
+            completion()
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.32
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            window.animator().setFrame(frame, display: true)
+        } completionHandler: {
+            completion()
+        }
     }
 
     /// Shows the controls and restarts the countdown that puts them away again.
@@ -1898,6 +2019,7 @@ struct ReaderView: View {
         guard let window,
               !isNativeFullScreen,
               !isNativeFullScreenTransition,
+              !isFullScreenAnimating,
               !window.styleMask.contains(.fullScreen)
         else { return }
 
@@ -1993,6 +2115,10 @@ struct ReaderView: View {
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.isHidden = hidden
         }
+        // Exclusive full screen disables the native green button even if the system
+        // briefly reveals the toolbar; native full screen is not allowed to start on
+        // top of the custom mode.
+        window.standardWindowButton(.zoomButton)?.isEnabled = !isReaderFullScreen
     }
 
     /// Puts the window chrome back in step with the reader: the traffic lights, the room
@@ -2097,6 +2223,12 @@ struct ReaderView: View {
     }
 }
 
+/// Mutable custom-full-screen bookkeeping. A reference keeps the animation completion
+/// reading the current generation rather than a captured value.
+private final class ReaderFullScreenState {
+    var generation = 0
+}
+
 /// Temporarily raises the window above AppKit's normal frame constraint.
 ///
 /// A titled `NSWindow` is clamped to the screen's visible frame, which stops it
@@ -2107,6 +2239,8 @@ struct ReaderView: View {
 /// windowed behaviour (and key-window handling) is untouched.
 @MainActor
 private enum ReaderFullScreenWindow {
+    static let subclassPrefix = "UzumakiReaderFullScreen_"
+
     static func enter(_ window: NSWindow) -> AnyClass? {
         let originalClass: AnyClass = type(of: window)
         let name = className(for: originalClass)
@@ -2167,7 +2301,7 @@ private enum ReaderFullScreenWindow {
         let safe = base.map { character in
             character.isLetter || character.isNumber ? String(character) : "_"
         }
-        return "UzumakiReaderFullScreen_" + safe.joined()
+        return subclassPrefix + safe.joined()
     }
 }
 
