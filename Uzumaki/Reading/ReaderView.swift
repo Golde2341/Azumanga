@@ -155,8 +155,9 @@ struct ReaderView: View {
             guard revealTick > 0 else { return }
             try? await Task.sleep(for: .seconds(3))
             // Never while something presented is open: the display popover and the chapter
-            // sheet are anchored to controls, and hiding those would take them along.
-            guard !Task.isCancelled, !showsDisplayOptions, !showChapterPicker else { return }
+            // sheet are anchored to controls, and hiding those would take them along. The
+            // progress bar must also stay put while it is being dragged.
+            guard !Task.isCancelled, !showsDisplayOptions, !showChapterPicker, !isScrubbing else { return }
             controlsVisible = false
         }
         .onAppear { revealControls() }
@@ -571,6 +572,50 @@ struct ReaderView: View {
                         progressBar
                     }
                     .frame(width: 260)
+                    .overlay {
+                        // A real slider does the tracking, over the whole block: a
+                        // click lands where it is aimed (including on the page count)
+                        // and a drag keeps going even when the pointer leaves the thin
+                        // bar. It is invisible; the artwork underneath is the bar.
+                        GeometryReader { geometry in
+                            Slider(value: $scrubFraction, in: 0...1) { editing in
+                                if editing {
+                                    // Keep the controls (and this bar) on screen for the
+                                    // whole drag.
+                                    revealControls()
+                                    isScrubbing = true
+                                } else {
+                                    let target = ReaderScrubbing.page(
+                                        atFraction: scrubFraction,
+                                        pageCount: model.pages.count
+                                    )
+                                    isScrubbing = false
+                                    model.goToPage(target)
+                                }
+                            }
+                            .labelsHidden()
+                            .focusable(false)
+                            .opacity(0.001)
+                            // Clicking the track jumps there even on control styles
+                            // that do not move the knob to the click themselves.
+                            .simultaneousGesture(
+                                SpatialTapGesture()
+                                    .onEnded { value in
+                                        let width = geometry.size.width
+                                        guard width > 0 else { return }
+                                        let fraction = min(max(0, value.location.x / width), 1)
+                                        scrubFraction = fraction
+                                        isScrubbing = false
+                                        model.goToPage(
+                                            ReaderScrubbing.page(
+                                                atFraction: fraction,
+                                                pageCount: model.pages.count
+                                            )
+                                        )
+                                    }
+                            )
+                        }
+                    }
 
                     Button {
                         Task { await model.goToChapter(index: model.currentChapterIndex + 1) }
@@ -587,6 +632,19 @@ struct ReaderView: View {
             }
         }
         .allowsHitTesting(!model.pages.isEmpty)
+        .onAppear { syncScrubberToCurrentPage() }
+        .onChange(of: model.currentIndex) { _, _ in syncScrubberToCurrentPage() }
+        .onChange(of: model.pages.count) { _, _ in syncScrubberToCurrentPage() }
+    }
+
+    /// Keeps the invisible slider's thumb on the page being read, so grabbing the
+    /// scrubbing track starts from where the reader actually is.
+    private func syncScrubberToCurrentPage() {
+        guard !isScrubbing else { return }
+        scrubFraction = ReaderScrubbing.fraction(
+            ofPage: model.currentIndex,
+            pageCount: model.pages.count
+        )
     }
 
     /// The page the bar is reporting: the one a drag has reached, or the one being read.
@@ -615,25 +673,9 @@ struct ReaderView: View {
                     .frame(width: 10, height: 10)
                     .offset(x: min(max(0, width * fraction - 5), max(0, width - 10)))
             }
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        guard width > 0 else { return }
-                        isScrubbing = true
-                        scrubFraction = min(max(0, value.location.x / width), 1)
-                    }
-                    .onEnded { _ in
-                        let target = ReaderScrubbing.page(
-                            atFraction: scrubFraction,
-                            pageCount: model.pages.count
-                        )
-                        isScrubbing = false
-                        model.goToPage(target)
-                    }
-            )
+            .frame(maxHeight: .infinity)
         }
-        .frame(height: 12)
+        .frame(height: 20)
         .help("Drag to jump to a page")
     }
 
@@ -655,8 +697,9 @@ struct ReaderView: View {
                 }
                 // The clearance for the traffic lights is applied inside this group's frame
                 // rather than around the whole row, so both ends stay the same width and the
-                // title stays centred on the window.
-                .padding(.leading, trafficLightSpan)
+                // title stays centred on the window. Full screen has no title bar, so the
+                // empty space is dropped there.
+                .padding(.leading, controlBarLeadingInset)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 titleControl
@@ -671,6 +714,9 @@ struct ReaderView: View {
         }
         .padding(.horizontal, 12)
         .padding(.top, controlBarTopPadding)
+        // A soft shadow lifts the floating bar off the page while the controls are up;
+        // it fades away with them.
+        .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 6)
         .onGeometryChange(for: CGFloat.self) { bar in
             bar.size.height
         } action: { height in
@@ -687,6 +733,12 @@ struct ReaderView: View {
               controlBarHeight > 0
         else { return 8 }
         return max(0, centre - controlBarHeight / 2)
+    }
+
+    /// How far the control bar steps in from the left edge to clear the traffic lights.
+    /// Full screen has no title bar of its own, so there is nothing to clear there.
+    private var controlBarLeadingInset: CGFloat {
+        isReaderFullScreen || isNativeFullScreen ? 0 : trafficLightSpan
     }
 
     /// The height of the display's camera housing, or zero when the display has none.
@@ -922,6 +974,11 @@ struct ReaderView: View {
         // notification handlers touches the window until it is windowed again.
         window.collectionBehavior.insert(.fullScreenPrimary)
 
+        // The reader is one window per chapter; never fold windows into tabs. A tab
+        // bar would otherwise come down together with the title bar in native full
+        // screen, where only the traffic lights should appear.
+        window.tabbingMode = .disallowed
+
         // An empty unified toolbar is what gives the traffic lights their ordinary
         // spacing away from the top-left corner; a toolbar-less window tucks them into
         // the corner. Nothing is drawn in it — the title bar is transparent and the
@@ -931,7 +988,25 @@ struct ReaderView: View {
             window.toolbar = NSToolbar(identifier: "UzumakiReaderToolbar")
         }
 
+        applyTrafficLightShadow(in: window)
+
         reconcileWindow(window)
+    }
+
+    /// Gives the traffic lights the same soft drop shadow as the floating controls.
+    private func applyTrafficLightShadow(in window: NSWindow) {
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
+        shadow.shadowBlurRadius = 5
+
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = window.standardWindowButton(type) else { continue }
+            // The offset follows the button's own coordinate space; standard controls
+            // are not flipped, so a negative height casts the shadow downwards.
+            shadow.shadowOffset = NSSize(width: 0, height: button.isFlipped ? 2 : -2)
+            button.wantsLayer = true
+            button.shadow = shadow
+        }
     }
 
     /// Records where the traffic lights sit, so the control bar can clear them and put its

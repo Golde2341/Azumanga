@@ -32,6 +32,7 @@ struct RootView: View {
     @Environment(AppEnvironment.self) private var app
 
     @State private var selection: SidebarItem? = .library
+    @State private var libraryPath = NavigationPath()
 
     var body: some View {
         NavigationSplitView {
@@ -43,7 +44,7 @@ struct RootView: View {
         } detail: {
             switch selection {
             case .library:
-                NavigationStack { LibraryView() }
+                NavigationStack(path: $libraryPath) { LibraryView(path: $libraryPath) }
             case .browse:
                 NavigationStack { BrowseView() }
             case .downloads:

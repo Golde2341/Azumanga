@@ -1,3 +1,4 @@
+import AppKit
 import SwiftData
 import SwiftUI
 
@@ -6,6 +7,10 @@ struct UzumakiApp: App {
     @State private var app: AppEnvironment
 
     init() {
+        // Reader windows are independent chapters, not documents: macOS must never
+        // merge them into tabs. The tab bar is what comes down with the title bar in
+        // native full screen, where only the traffic lights belong.
+        NSWindow.allowsAutomaticWindowTabbing = false
         _app = State(initialValue: AppEnvironment())
     }
 

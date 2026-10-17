@@ -4,6 +4,7 @@ import SwiftUI
 /// The user's saved manga, plus favourites, categories, reading history and
 /// page bookmarks.
 struct LibraryView: View {
+    @Binding var path: NavigationPath
     @Environment(LibraryModel.self) private var library
     @Environment(\.openWindow) private var openWindow
 
@@ -93,7 +94,13 @@ struct LibraryView: View {
             )
         } else if layout == .grid {
             ScrollView {
-                MangaGrid(items: visibleEntries.map(\.manga), favoriteIds: favoriteKeys, progressLabel: progressLabel)
+                MangaGrid(
+                    items: visibleEntries.map(\.manga),
+                    favoriteIds: favoriteKeys,
+                    progressLabel: progressLabel,
+                    onOpen: { path.append($0) },
+                    onForceTouch: continueReading
+                )
             }
         } else {
             List {
@@ -156,6 +163,30 @@ struct LibraryView: View {
             chapterId: bookmark.chapterId,
             startPageIndex: bookmark.pageIndex
         )
+    }
+
+    /// Force clicking a library cover opens the reader at the page that was being read.
+    /// Returns whether there was progress to continue from; without it the force click
+    /// falls through to the card's normal navigation.
+    private func continueReading(_ manga: Manga) -> Bool {
+        guard let entry = library.entry(for: manga),
+              let chapterId = entry.lastReadChapterId
+        else { return false }
+
+        let chapter = Chapter(
+            sourceId: manga.sourceId,
+            mangaId: manga.mangaId,
+            chapterId: chapterId,
+            title: entry.lastReadChapterTitle,
+            number: entry.lastReadChapterNumber
+        )
+        openWindow(value: ReaderSession(
+            manga: manga,
+            chapters: [],
+            chapterId: chapterId,
+            startPageIndex: library.progress(for: chapter)?.lastPageIndex
+        ))
+        return true
     }
 
     // MARK: - History
