@@ -86,6 +86,9 @@ struct ReaderView: View {
     @State private var showsDisplayOptions = false
     /// Where along the progress bar a drag has reached, while it is being dragged.
     @State private var isScrubbing = false
+    /// Whether the corner grip is driving the window size. The controls must stay
+    /// visible while it is.
+    @State private var isResizingWindow = false
     @State private var scrubFraction: CGFloat = 0
     /// A page's width over its height, once one of them has loaded and can be measured.
     @State private var pageAspect: CGFloat?
@@ -139,6 +142,34 @@ struct ReaderView: View {
                 pageIndicator
                     .transition(.opacity)
             }
+
+            if controlsVisible, let window, !isReaderFullScreen, !isNativeFullScreen {
+                // The OS's edge hit areas are easy to miss, and live resizing the
+                // chrome-heavy reader window does nothing on this macOS. An explicit
+                // grip resizes the window directly and disappears with the controls.
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        ReaderResizeGrip(
+                            window: window,
+                            aspectRatio: windowAspectRatio,
+                            onBegan: {
+                                revealControls()
+                                isResizingWindow = true
+                            },
+                            onEnded: {
+                                isResizingWindow = false
+                                revealControls()
+                            }
+                        )
+                        .frame(width: 22, height: 22)
+                        .padding(.trailing, 10)
+                        .padding(.bottom, 10)
+                    }
+                }
+                .transition(.opacity)
+            }
         }
         .animation(.easeInOut(duration: 0.18), value: controlsVisible)
         .animation(.easeInOut(duration: 0.3), value: showIntroCover)
@@ -170,7 +201,9 @@ struct ReaderView: View {
             // Never while something presented is open: the display popover and the chapter
             // sheet are anchored to controls, and hiding those would take them along. The
             // progress bar must also stay put while it is being dragged.
-            guard !Task.isCancelled, !showsDisplayOptions, !showChapterPicker, !isScrubbing else { return }
+            guard !Task.isCancelled, !showsDisplayOptions, !showChapterPicker,
+                  !isScrubbing, !isResizingWindow
+            else { return }
             controlsVisible = false
         }
         .onAppear {
@@ -225,7 +258,9 @@ struct ReaderView: View {
             for attempt in 0..<4 {
                 await readPageAspect()
                 if let window {
-                    reconcileWindow(window)
+                    // Resize once the page's real shape is known, so a horizontal
+                    // window takes the page's proportions instead of framing it.
+                    reconcileWindow(window, resizingWindowShape: pageAspect != nil)
                 }
                 if pageAspect != nil || attempt == 3 { return }
                 try? await Task.sleep(for: .seconds(1))
@@ -233,6 +268,11 @@ struct ReaderView: View {
         }
         .onChange(of: settings.layout) { _, _ in
             guard let window else { return }
+            if settings.layout == .vertical {
+                // Releasing the lock must not wait on full-screen bookkeeping; this
+                // only clears the ratio and any stuck size limit, it never resizes.
+                applyWindowShape()
+            }
             reconcileWindow(window, resizingWindowShape: true)
         }
         .onChange(of: settings.pageMode) { _, _ in
@@ -323,10 +363,9 @@ struct ReaderView: View {
         isReaderFullScreen = true
         settings.readerFullscreen = true
 
-        // The page fills the screen, so the windowed aspect-ratio lock goes away and
-        // edge drags cannot resize the window underneath the page.
+        // The page fills the screen; the grip that shapes the windowed reader is
+        // not available there.
         appliedAspectRatio = 0
-        window.contentAspectRatio = .zero
         window.minSize = screen.frame.size
         window.maxSize = screen.frame.size
 
@@ -1147,9 +1186,16 @@ struct ReaderView: View {
         applyWindowShape(resizing: resizingWindowShape)
     }
 
-    /// The window's shape when two pages are read at a time: two of them side by side.
-    private var twoPageAspectRatio: CGFloat {
-        2 * (pageAspect ?? Self.typicalPageAspectRatio)
+    /// The window's shape in the current reading mode, or `nil` when it is free.
+    ///
+    /// Vertical scrolling reads at any window width, so the window stays freely
+    /// resizable. Horizontal reading is locked to exactly what it shows: one page, or
+    /// two side by side. Without the single-page lock the window keeps its old shape
+    /// and the page sits between bars.
+    private var windowAspectRatio: CGFloat? {
+        guard settings.layout == .horizontal else { return nil }
+        let page = pageAspect ?? Self.typicalPageAspectRatio
+        return settings.pageMode == .double ? page * 2 : page
     }
 
     /// A page's width over its height, read from a page of the current spread that has
@@ -1176,12 +1222,13 @@ struct ReaderView: View {
     /// Stand-in proportions, used until a page has loaded.
     private static let typicalPageAspectRatio: CGFloat = 2.0 / 3.0
 
-    /// Locks the window to the shape of the pages it is showing, so a two-page spread fills
+    /// Shapes the window to the pages it is showing, so a spread or a single page fills
     /// it instead of being letterboxed inside it.
     ///
-    /// Released whenever two pages are not being read at a time, and around full screen:
-    /// the ratio is dropped before entering and re-applied once the window is windowed
-    /// again, because an aspect ratio would fight the window filling the display.
+    /// AppKit's `contentAspectRatio` is deliberately not used: setting it — even back
+    /// to zero to release it — makes window resizing produce NaN frames on macOS
+    /// 26/27 and crashes on the next resize or window-centering action. The resize
+    /// grip enforces the same ratio while the user drags it.
     ///
     /// `resizing` also resizes the window to take the shape on. That is only safe once the
     /// window is settled, so the full screen transitions never ask for it — resizing the
@@ -1192,16 +1239,12 @@ struct ReaderView: View {
         // The screen-filling window is not shaped to the page; the lock is dropped on
         // entry and re-applied when the window is back at its windowed size.
         guard !isReaderFullScreen, !window.styleMask.contains(.fullScreen) else { return }
-        guard settings.layout == .horizontal,
-              settings.pageMode == .double
-        else {
+
+        guard let ratio = windowAspectRatio else {
             appliedAspectRatio = 0
-            window.contentAspectRatio = .zero
+            releaseStuckSizeLimit(in: window)
             return
         }
-
-        let ratio = twoPageAspectRatio
-        window.contentAspectRatio = NSSize(width: ratio, height: 1)
 
         // Take the shape on when it is first applied or whenever the pages' proportions turn
         // out to be different, keeping the width.
@@ -1211,6 +1254,156 @@ struct ReaderView: View {
         let width = window.contentRect(forFrameRect: window.frame).width
         guard width > 0 else { return }
         window.setContentSize(NSSize(width: width, height: (width / ratio).rounded()))
+    }
+
+    /// A reader that is not filling the screen must always be resizable. If a
+    /// screen-filling pass left the window's limits pinned to the display, put
+    /// ordinary limits back.
+    private func releaseStuckSizeLimit(in window: NSWindow) {
+        guard let screenSize = (window.screen ?? NSScreen.main)?.frame.size,
+              window.minSize == screenSize,
+              window.maxSize == screenSize
+        else { return }
+
+        window.minSize = .zero
+        window.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+    }
+}
+
+/// A corner grip that resizes the reader window.
+///
+/// The resize is driven straight from AppKit mouse events and screen coordinates.
+/// A SwiftUI drag re-renders the view on every update, which makes the window lag
+/// behind the pointer; AppKit tracking keeps the corner exactly under the cursor.
+/// Locked reading modes keep their aspect ratio.
+private struct ReaderResizeGrip: NSViewRepresentable {
+    let window: NSWindow
+    let aspectRatio: CGFloat?
+    let onBegan: () -> Void
+    let onEnded: () -> Void
+
+    func makeNSView(context: Context) -> GripView {
+        let view = GripView()
+        configure(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: GripView, context: Context) {
+        configure(nsView)
+    }
+
+    private func configure(_ view: GripView) {
+        view.targetWindow = window
+        view.aspectRatio = aspectRatio
+        view.onBegan = onBegan
+        view.onEnded = onEnded
+    }
+
+    final class GripView: NSView {
+        var targetWindow: NSWindow?
+        var aspectRatio: CGFloat?
+        var onBegan: (() -> Void)?
+        var onEnded: (() -> Void)?
+
+        private var startFrame: NSRect?
+        private var startMouse: NSPoint?
+        private var didDrag = false
+        private let symbolView = NSImageView()
+
+        private static let minimumSize = NSSize(width: 420, height: 260)
+
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+            layer?.backgroundColor = NSColor(white: 0.5, alpha: 0.22).cgColor
+            layer?.cornerRadius = 11
+
+            let configuration = NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
+            symbolView.image = NSImage(
+                systemSymbolName: "arrow.down.right",
+                accessibilityDescription: "Resize"
+            )?.withSymbolConfiguration(configuration)
+            symbolView.contentTintColor = .secondaryLabelColor
+            symbolView.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(symbolView)
+            NSLayoutConstraint.activate([
+                symbolView.centerXAnchor.constraint(equalTo: centerXAnchor),
+                symbolView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            ])
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func resetCursorRects() {
+            addCursorRect(
+                bounds,
+                cursor: .frameResize(position: .bottomRight, directions: .all)
+            )
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            startFrame = targetWindow?.frame
+            startMouse = NSEvent.mouseLocation
+            didDrag = false
+            onBegan?()
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let window = targetWindow,
+                  let start = startFrame,
+                  let anchor = startMouse
+            else { return }
+
+            didDrag = true
+            let location = NSEvent.mouseLocation
+            let dx = location.x - anchor.x
+            let dy = location.y - anchor.y
+
+            // Dragging right grows the window; dragging down grows it while the top
+            // edge stays put (AppKit screen coordinates grow upwards).
+            var width = start.width + dx
+            var height = start.height - dy
+
+            if let aspectRatio {
+                let fromWidth = start.width + dx
+                let fromHeight = (start.height - dy) * aspectRatio
+                width = max(fromWidth, fromHeight)
+                height = width / aspectRatio
+            }
+
+            width = max(width, Self.minimumSize.width)
+            height = max(height, Self.minimumSize.height)
+            if let aspectRatio {
+                width = max(width, Self.minimumSize.height * aspectRatio)
+                height = width / aspectRatio
+            }
+
+            window.setFrame(
+                NSRect(
+                    x: start.minX,
+                    y: start.maxY - height,
+                    width: width,
+                    height: height
+                ),
+                display: false
+            )
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            if didDrag, let window = targetWindow {
+                window.setFrame(window.frame, display: true)
+            }
+            startFrame = nil
+            startMouse = nil
+            didDrag = false
+            onEnded?()
+        }
     }
 }
 
