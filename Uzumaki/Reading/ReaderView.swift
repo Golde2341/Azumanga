@@ -99,6 +99,10 @@ struct ReaderView: View {
     @State private var trafficLightSpan: CGFloat = 64
     /// The control bar's own height, measured for that same calculation.
     @State private var controlBarHeight: CGFloat = 0
+    /// Plays the cover-to-pages opening once, when the reader is first shown.
+    @State private var hasFinishedIntro = false
+    /// Keeps the cover on screen until the reveal has played and it can be removed.
+    @State private var showIntroCover = true
 
     var body: some View {
         ZStack {
@@ -106,16 +110,24 @@ struct ReaderView: View {
                 .ignoresSafeArea()
 
             content
+                // The pages settle from slightly zoomed out while the cover lifts away.
+                .scaleEffect(hasFinishedIntro ? 1 : 0.94)
+                .opacity(hasFinishedIntro ? 1 : 0)
                 // A click on the page also brings the controls back, for when the pointer
                 // has not moved to do it.
                 .simultaneousGesture(TapGesture().onEnded { revealControls() })
 
-            if model.isLoading {
+            if model.isLoading && !showIntroCover {
                 ProgressView()
                     .controlSize(.large)
             }
 
-            if controlsVisible {
+            if showIntroCover {
+                introCover
+                    .transition(.opacity)
+            }
+
+            if controlsVisible && !showIntroCover {
                 VStack {
                     controlBar
                     Spacer()
@@ -123,12 +135,13 @@ struct ReaderView: View {
                 .transition(.opacity)
             }
 
-            if controlsVisible {
+            if controlsVisible && !showIntroCover {
                 pageIndicator
                     .transition(.opacity)
             }
         }
         .animation(.easeInOut(duration: 0.18), value: controlsVisible)
+        .animation(.easeInOut(duration: 0.3), value: showIntroCover)
         // The page runs to the very top edge. Without this the window keeps a strip the
         // height of a title bar above the content, which reads as a bar across the top even
         // though no title is drawn in it.
@@ -160,7 +173,10 @@ struct ReaderView: View {
             guard !Task.isCancelled, !showsDisplayOptions, !showChapterPicker, !isScrubbing else { return }
             controlsVisible = false
         }
-        .onAppear { revealControls() }
+        .onAppear {
+            revealControls()
+            scheduleIntroIfNeeded()
+        }
         // The window hosting the view, reported by AppKit rather than guessed from
         // whichever window happens to be key.
         .background(WindowAccessor(window: $window))
@@ -222,6 +238,9 @@ struct ReaderView: View {
         .onChange(of: settings.pageMode) { _, _ in
             guard let window else { return }
             reconcileWindow(window, resizingWindowShape: true)
+        }
+        .onChange(of: model.isLoading) { _, isLoading in
+            if !isLoading { scheduleIntroIfNeeded() }
         }
         // Native full screen is tracked separately from the reader's own screen-filling
         // mode. Nothing is done to the window from `will…` until the transition has
@@ -353,6 +372,81 @@ struct ReaderView: View {
     private func revealControls() {
         controlsVisible = true
         revealTick += 1
+    }
+
+    /// Starts the opening reveal once the chapter has loaded. Waiting for the first
+    /// page image keeps the cover from zooming away onto a placeholder; the timeout
+    /// keeps a slow or failed image from leaving the cover up forever.
+    private func scheduleIntroIfNeeded() {
+        guard showIntroCover, !hasFinishedIntro, !model.isLoading else { return }
+
+        guard let firstPage = model.pages.first else {
+            finishIntro()
+            return
+        }
+
+        let size = model.renderMaxPixelSize
+        Task {
+            _ = try? await images.image(for: firstPage, maxPixelSize: size)
+            finishIntro()
+        }
+        Task {
+            try? await Task.sleep(for: .milliseconds(1800))
+            finishIntro()
+        }
+    }
+
+    /// Zooms the cover away while the pages settle into place, then removes it.
+    private func finishIntro() {
+        guard !hasFinishedIntro else { return }
+        withAnimation(.spring(response: 0.48, dampingFraction: 0.8)) {
+            hasFinishedIntro = true
+        }
+        Task {
+            try? await Task.sleep(for: .milliseconds(550))
+            withAnimation(.easeInOut(duration: 0.28)) {
+                showIntroCover = false
+            }
+            revealControls()
+        }
+    }
+
+    /// The manga cover shown while the chapter loads: centred over a soft copy of
+    /// itself, then zoomed, blurred and faded away as the pages arrive.
+    private var introCover: some View {
+        GeometryReader { geometry in
+            let coverWidth = min(
+                geometry.size.width * 0.32,
+                geometry.size.height * 0.42,
+                340
+            )
+
+            ZStack {
+                if let coverURL = model.manga.coverURL {
+                    CoverImage(url: coverURL)
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .blur(radius: 70)
+                        .opacity(0.32)
+                }
+
+                VStack(spacing: 22) {
+                    CoverImage(url: model.manga.coverURL)
+                        .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                        .frame(width: coverWidth)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .shadow(color: .black.opacity(0.45), radius: 30, x: 0, y: 18)
+
+                    ProgressView()
+                        .controlSize(.small)
+                        .opacity(model.isLoading ? 1 : 0)
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+        }
+        .scaleEffect(hasFinishedIntro ? 1.9 : 1)
+        .opacity(hasFinishedIntro ? 0 : 1)
+        .blur(radius: hasFinishedIntro ? 32 : 0)
+        .allowsHitTesting(false)
     }
 
     // MARK: - Content

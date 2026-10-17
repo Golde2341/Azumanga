@@ -100,11 +100,6 @@ private struct MangaForceTouchOverlay: NSViewRepresentable {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             pressureConfiguration = NSPressureConfiguration(pressureBehavior: .primaryDeepClick)
-            NSLog(
-                "FTOUCH attach window=%@ config=%@",
-                window?.title ?? "nil",
-                String(describing: pressureConfiguration)
-            )
         }
 
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -116,22 +111,14 @@ private struct MangaForceTouchOverlay: NSViewRepresentable {
         override func mouseDown(with event: NSEvent) {
             isPressed = true
             forceHandled = false
-            NSLog(
-                "FTOUCH down config=%@ pressure=%f",
-                String(describing: pressureConfiguration),
-                Double(event.pressure)
-            )
         }
 
         override func pressureChange(with event: NSEvent) {
-            NSLog("FTOUCH pressure stage=%d pressure=%f", event.stage, Double(event.pressure))
             guard isPressed, event.stage == 2, !forceHandled else { return }
             forceHandled = onForceClick?() ?? false
-            NSLog("FTOUCH force handled=%d", forceHandled)
         }
 
         override func mouseUp(with event: NSEvent) {
-            NSLog("FTOUCH up")
             let inside = bounds.contains(convert(event.locationInWindow, from: nil))
             let handledByForce = forceHandled
             isPressed = false
