@@ -81,9 +81,6 @@ struct ReaderView: View {
     /// mode sits above the menu bar so the page reaches the display's top edge and the
     /// camera housing no longer leaves a reserved strip.
     @State private var windowedLevel: NSWindow.Level?
-    /// The window's class before a temporary subclass removes AppKit's visible-frame
-    /// clamp for the duration of the custom full screen.
-    @State private var windowedClass: AnyClass?
     private static let readerFullScreenLevel = NSWindow.Level(
         rawValue: NSWindow.Level.mainMenu.rawValue + 2
     )
@@ -426,9 +423,7 @@ struct ReaderView: View {
                     NSApp.presentationOptions = savedPresentationOptions
                 }
                 if let window {
-                    if let windowedClass {
-                        ReaderFullScreenWindow.exit(window, originalClass: windowedClass)
-                    }
+                    ReaderFullScreenWindow.exit(window)
                     if let windowedLevel {
                         window.level = windowedLevel
                     }
@@ -463,7 +458,7 @@ struct ReaderView: View {
         windowedFrame = window.frame
         windowedSizeLimits = (window.minSize, window.maxSize)
         windowedLevel = window.level
-        windowedClass = ReaderFullScreenWindow.enter(window)
+        ReaderFullScreenWindow.enter(window)
         savedPresentationOptions = NSApp.presentationOptions
         isReaderFullScreen = true
         settings.readerFullscreen = true
@@ -538,10 +533,7 @@ struct ReaderView: View {
 
             window.isMovable = true
 
-            if let windowedClass {
-                ReaderFullScreenWindow.exit(window, originalClass: windowedClass)
-                self.windowedClass = nil
-            }
+            ReaderFullScreenWindow.exit(window)
             if let windowedLevel {
                 window.level = windowedLevel
                 self.windowedLevel = nil
@@ -554,22 +546,17 @@ struct ReaderView: View {
     /// Drops the exclusive-full-screen state immediately when AppKit starts its own
     /// full-screen transition.
     ///
-    /// Native full screen must not inherit the custom mode's temporary window class,
-    /// high level, pinned frame or presentation options: AppKit's transition can hang
-    /// when it does. This is the safety net for a native transition started by a menu
-    /// command or shortcut while the custom mode is active or still animating. Normal
-    /// windowed entries find none of these markers and are untouched.
+    /// Native full screen must not inherit the custom mode's high window level,
+    /// pinned frame or presentation options: AppKit's transition can hang when it
+    /// does. This is the safety net for a native transition started by a menu command
+    /// or shortcut while the custom mode is active or still animating. Normal
+    /// windowed entries are untouched.
     private func abandonCustomFullScreenIfNeeded(_ window: NSWindow) {
-        let currentClass: AnyClass = type(of: window)
-        let hasResidualClass = NSStringFromClass(currentClass)
-            .hasPrefix(ReaderFullScreenWindow.subclassPrefix)
         let hasResidualLevel = window.level.rawValue > NSWindow.Level.mainMenu.rawValue
 
         guard isReaderFullScreen
                 || isFullScreenAnimating
-                || windowedClass != nil
                 || windowedLevel != nil
-                || hasResidualClass
                 || hasResidualLevel
         else { return }
 
@@ -592,12 +579,7 @@ struct ReaderView: View {
         window.collectionBehavior.remove(.fullScreenNone)
         window.collectionBehavior.insert(.fullScreenPrimary)
 
-        if let originalClass = windowedClass {
-            ReaderFullScreenWindow.exit(window, originalClass: originalClass)
-        } else if hasResidualClass, let superclass = class_getSuperclass(currentClass) {
-            object_setClass(window, superclass)
-        }
-        windowedClass = nil
+        ReaderFullScreenWindow.exit(window)
 
         if let originalLevel = windowedLevel {
             window.level = originalLevel
@@ -2232,76 +2214,49 @@ private final class ReaderFullScreenState {
 /// Temporarily raises the window above AppKit's normal frame constraint.
 ///
 /// A titled `NSWindow` is clamped to the screen's visible frame, which stops it
-/// below the menu bar and leaves the camera-housing strip uncovered. The window is
-/// re-classed into a tiny runtime subclass for the duration of the custom full
-/// screen; the subclass only overrides `constrainFrameRect(_:to:)` to return the
-/// requested frame unchanged. The original class is restored on exit, so normal
-/// windowed behaviour (and key-window handling) is untouched.
+/// below the menu bar and leaves the camera-housing strip uncovered. AppKit's
+/// constrained method is replaced on the window's class — not the window's `isa` —
+/// and only the active custom-full-screen window is allowed through. Changing a
+/// window's class breaks the KVO registrations AppKit's titlebar uses, which made
+/// the native full-screen transition throw and hang; a method-level replacement
+/// leaves the window's identity and observers intact.
 @MainActor
 private enum ReaderFullScreenWindow {
-    static let subclassPrefix = "UzumakiReaderFullScreen_"
+    private static let selector = #selector(NSWindow.constrainFrameRect(_:to:))
+    private static var swizzledClasses = Set<ObjectIdentifier>()
+    private static let activeWindows = NSHashTable<NSWindow>.weakObjects()
 
-    static func enter(_ window: NSWindow) -> AnyClass? {
-        let originalClass: AnyClass = type(of: window)
-        let name = className(for: originalClass)
+    static func enter(_ window: NSWindow) {
+        let windowClass: AnyClass = type(of: window)
+        let key = ObjectIdentifier(windowClass)
 
-        let subclass: AnyClass
-        if let existing = NSClassFromString(name),
-           let superclass = class_getSuperclass(existing),
-           ObjectIdentifier(superclass) == ObjectIdentifier(originalClass) {
-            subclass = existing
-        } else if let created = makeSubclass(named: name, from: originalClass) {
-            subclass = created
-        } else {
-            return nil
+        if !swizzledClasses.contains(key),
+           let method = class_getInstanceMethod(windowClass, selector),
+           let types = method_getTypeEncoding(method) {
+            let originalImplementation = method_getImplementation(method)
+
+            let block: @convention(block) (NSWindow, NSRect, NSScreen?) -> NSRect = { window, frame, screen in
+                let allowed = Thread.isMainThread
+                    ? MainActor.assumeIsolated { activeWindows.contains(window) }
+                    : false
+                if allowed {
+                    return frame
+                }
+                typealias ConstrainFunction = @convention(c) (NSWindow, Selector, NSRect, NSScreen?) -> NSRect
+                let original = unsafeBitCast(originalImplementation, to: ConstrainFunction.self)
+                return original(window, selector, frame, screen)
+            }
+
+            let implementation = imp_implementationWithBlock(block)
+            class_replaceMethod(windowClass, selector, implementation, types)
+            swizzledClasses.insert(key)
         }
 
-        if ObjectIdentifier(type(of: window)) != ObjectIdentifier(subclass) {
-            object_setClass(window, subclass)
-        }
-        return originalClass
+        activeWindows.add(window)
     }
 
-    static func exit(_ window: NSWindow, originalClass: AnyClass) {
-        if ObjectIdentifier(type(of: window)) != ObjectIdentifier(originalClass) {
-            object_setClass(window, originalClass)
-        }
-    }
-
-    private static func makeSubclass(named name: String, from baseClass: AnyClass) -> AnyClass? {
-        guard let subclass = objc_allocateClassPair(baseClass, name, 0) else {
-            return nil
-        }
-
-        let selector = #selector(NSWindow.constrainFrameRect(_:to:))
-        guard let method = class_getInstanceMethod(NSWindow.self, selector),
-              let types = method_getTypeEncoding(method)
-        else {
-            objc_disposeClassPair(subclass)
-            return nil
-        }
-
-        let block: @convention(block) (AnyObject, NSRect, NSScreen?) -> NSRect = { _, frame, _ in
-            frame
-        }
-        let implementation = imp_implementationWithBlock(block)
-        guard class_addMethod(subclass, selector, implementation, types) else {
-            objc_disposeClassPair(subclass)
-            return nil
-        }
-
-        objc_registerClassPair(subclass)
-        return subclass
-    }
-
-    /// One subclass per base window class. SwiftUI's window class is private, so the
-    /// name is derived from it rather than assumed.
-    private static func className(for baseClass: AnyClass) -> String {
-        let base = NSStringFromClass(baseClass)
-        let safe = base.map { character in
-            character.isLetter || character.isNumber ? String(character) : "_"
-        }
-        return subclassPrefix + safe.joined()
+    static func exit(_ window: NSWindow) {
+        activeWindows.remove(window)
     }
 }
 
