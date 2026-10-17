@@ -37,6 +37,12 @@ struct ReaderContainerView: View {
 
 /// The reading surface: vertical continuous or horizontal paged, with zoom,
 /// keyboard shortcuts, chapter navigation and automatic progress saving.
+///
+/// The window itself is managed by the scene (`.windowStyle(.hiddenTitleBar)` in
+/// `UzumakiApp.swift`). The reader fills the screen with a plain window frame change
+/// rather than AppKit's native full screen, which on macOS 26/27 can wedge the window
+/// on exit. Window chrome (traffic lights, page shape) is only applied from
+/// `reconcileWindow`.
 struct ReaderView: View {
     @Bindable var model: ReaderModel
 
@@ -45,8 +51,21 @@ struct ReaderView: View {
     @Environment(\.imagePipeline) private var images
 
     @State private var showChapterPicker = false
-    /// The window hosting the reader, used to drive full screen.
+    /// The window hosting the reader, used to drive full screen and measure traffic lights.
     @State private var window: NSWindow?
+    /// Whether the reader is filling the screen in its own windowed mode. The reader
+    /// deliberately does not use AppKit's native full screen: on macOS 26/27 the native
+    /// transition can wedge the window on exit, and the reader window is the one thing
+    /// that cannot be rebuilt. This mode only sizes the window and hides the system
+    /// chrome, which the window server handles as an ordinary resize.
+    @State private var isReaderFullScreen = false
+    /// The window's frame from before it filled the screen, restored when leaving.
+    @State private var windowedFrame: NSRect?
+    /// The window's size limits from before it filled the screen. While filling the
+    /// screen they are pinned so edge drags cannot shrink the page.
+    @State private var windowedSizeLimits: (min: NSSize, max: NSSize)?
+    /// The app's presentation options from before full screen, restored when leaving.
+    @State private var savedPresentationOptions: NSApplication.PresentationOptions = []
     /// The spread on screen, as the id of its first page. Two-way bound to the scroll
     /// view, so a gesture reports where it landed and a keyboard turn can drive it back.
     @State private var spreadPosition: Int?
@@ -109,15 +128,11 @@ struct ReaderView: View {
         // height of a title bar above the content, which reads as a bar across the top even
         // though no title is drawn in it.
         .ignoresSafeArea(.container, edges: .top)
-        // The window has an empty toolbar, which is what gives the traffic lights their
-        // ordinary spacing. In full screen macOS would otherwise draw it at the top of the
-        // display — and being empty, it is a blank strip of material. Asking for it on hover
-        // is as far as this can go: hiding the window toolbar outright changes the title bar
-        // itself, and doing that around a full screen transition is what hangs the window.
-        .windowToolbarFullScreenVisibility(.onHover)
+        // The traffic lights follow the controls, so a reader with the controls put
+        // away has nothing on screen but the page.
         .onChange(of: controlsVisible) { _, _ in
             guard let window else { return }
-            applyTrafficLightVisibility(in: window)
+            reconcileWindow(window)
         }
         .onHover { isInside in
             // Only the pointer arriving counts. Movement inside the reader deliberately
@@ -137,7 +152,15 @@ struct ReaderView: View {
             controlsVisible = false
         }
         .onAppear { revealControls() }
+        // The window hosting the view, reported by AppKit rather than guessed from
+        // whichever window happens to be key.
         .background(WindowAccessor(window: $window))
+        .onChange(of: window) { _, newWindow in
+            // One-time window setup: make the page run under the title bar and keep
+            // AppKit's own full screen out of the reader's way.
+            guard let newWindow else { return }
+            makeBorderless(newWindow)
+        }
         .navigationTitle(model.chapterLabel)
         .focusable()
         .focusEffectDisabled()
@@ -156,206 +179,105 @@ struct ReaderView: View {
         .onKeyPress("]") { Task { await model.goToChapter(index: model.currentChapterIndex + 1) }; return .handled }
         .onKeyPress("b") { model.toggleBookmark(); return .handled }
         .onKeyPress("f") { toggleFullScreen(); return .handled }
+        .onKeyPress(.escape) {
+            // Escape leaves full screen first, the way it does in a native full
+            // screen window; only an ordinary window closes the reader.
+            if isReaderFullScreen {
+                toggleFullScreen()
+            } else {
+                model.flushProgress()
+                dismiss()
+            }
+            return .handled
+        }
         .onKeyPress("m") { model.markCurrentChapterRead(); return .handled }
         .sheet(isPresented: $showChapterPicker) {
             ChapterPickerSheet(model: model, isPresented: $showChapterPicker)
         }
-        .onChange(of: window) { _, newValue in
-            guard let newValue else { return }
-            makeBorderless(newValue)
-            restoreFullScreenPreference(in: newValue)
-            applyWindowShape(resizing: true)
-        }
-        .onChange(of: settings.layout) { _, _ in applyWindowShape(resizing: true) }
-        .onChange(of: settings.pageMode) { _, _ in applyWindowShape(resizing: true) }
         .task(id: model.currentIndex) {
             // A page's proportions are only knowable once its image has been loaded, so this
             // looks again a few times before settling for the stand-in.
             for attempt in 0..<4 {
                 await readPageAspect()
-                applyWindowShape()
+                if let window {
+                    reconcileWindow(window)
+                }
                 if pageAspect != nil || attempt == 3 { return }
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-        .task(id: window) {
-            // Track full screen as it actually is, so leaving it with the green
-            // button is remembered just like the toolbar toggle.
+        .onChange(of: settings.layout) { _, _ in
             guard let window else { return }
-            for await _ in NotificationCenter.default.notifications(
-                named: NSWindow.didEnterFullScreenNotification,
-                object: window
-            ) {
-                settings.readerFullscreen = true
-                // Nothing touches the window here. It is in the middle of AppKit's full
-                // screen transition, and mutating the window in that state is what hung it.
-                // The work waits until the transition has settled.
-                let window = window
-                Task {
-                    try? await Task.sleep(for: .seconds(1))
-                    guard window.styleMask.contains(.fullScreen) else { return }
-                    applyWindowShape()
-                }
-            }
+            reconcileWindow(window, resizingWindowShape: true)
         }
-        .task(id: window) {
+        .onChange(of: settings.pageMode) { _, _ in
             guard let window else { return }
-            for await _ in NotificationCenter.default.notifications(
-                named: NSWindow.didExitFullScreenNotification,
-                object: window
-            ) {
-                settings.readerFullscreen = false
-                // Same again: the window is still settling back, so the measuring and the
-                // shape wait for it.
-                let window = window
-                Task {
-                    try? await Task.sleep(for: .seconds(1))
-                    guard !window.styleMask.contains(.fullScreen) else { return }
-                    measureTrafficLights(in: window)
-                    applyWindowShape()
-                }
-            }
+            reconcileWindow(window, resizingWindowShape: true)
         }
         .onDisappear {
+            // Presentation options are app-wide, so full screen must not outlive the view.
+            if isReaderFullScreen, NSApp.isActive {
+                NSApp.presentationOptions = savedPresentationOptions
+            }
             model.flushProgress()
         }
+    }
+
+    /// Fills the screen with the reader without involving AppKit's full screen.
+    ///
+    /// The window stays an ordinary window the whole time: only its frame and the
+    /// system's presentation options change. There is no space transition and no
+    /// title bar swap, which is what avoids the native full screen exit hang.
+    private func enterReaderFullScreen(_ window: NSWindow) {
+        guard !isReaderFullScreen, let screen = window.screen ?? NSScreen.main else { return }
+        windowedFrame = window.frame
+        windowedSizeLimits = (window.minSize, window.maxSize)
+        savedPresentationOptions = NSApp.presentationOptions
+        isReaderFullScreen = true
+        settings.readerFullscreen = true
+
+        // The page fills the screen, so the windowed aspect-ratio lock goes away and
+        // edge drags cannot resize the window underneath the page.
+        appliedAspectRatio = 0
+        window.contentAspectRatio = .zero
+        window.minSize = screen.frame.size
+        window.maxSize = screen.frame.size
+
+        if NSApp.isActive {
+            NSApp.presentationOptions = [.autoHideMenuBar, .autoHideDock]
+        }
+        // A screen-filling window should not slide around under the pointer.
+        window.isMovable = false
+        window.setFrame(screen.frame, display: true)
+        reconcileWindow(window)
+    }
+
+    /// Puts the window back where it was and hands the menu bar and Dock back.
+    private func exitReaderFullScreen(_ window: NSWindow) {
+        guard isReaderFullScreen else { return }
+        isReaderFullScreen = false
+        settings.readerFullscreen = false
+
+        if NSApp.isActive {
+            NSApp.presentationOptions = savedPresentationOptions
+        }
+        if let windowedSizeLimits {
+            window.minSize = windowedSizeLimits.min
+            window.maxSize = windowedSizeLimits.max
+            self.windowedSizeLimits = nil
+        }
+        window.isMovable = true
+        if let windowedFrame {
+            window.setFrame(windowedFrame, display: true)
+            self.windowedFrame = nil
+        }
+        reconcileWindow(window)
     }
 
     /// Shows the controls and restarts the countdown that puts them away again.
     private func revealControls() {
         controlsVisible = true
         revealTick += 1
-    }
-
-    /// Makes the reader window borderless: no title bar of its own, and the page drawn from
-    /// the very top edge with the traffic lights floating over it.
-    ///
-    /// `.windowStyle(.hiddenTitleBar)` hides the title but still reserves the title bar's
-    /// height, which is what left a bar across the top of the window. `fullSizeContentView`
-    /// is what lets the content into that space.
-    private func makeBorderless(_ window: NSWindow) {
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.styleMask.insert(.fullSizeContentView)
-        window.titlebarSeparatorStyle = .none
-
-        // An empty toolbar is the root of the traffic lights' spacing. macOS lays them out
-        // the way it does for an ordinary window when a toolbar is present, and tucks them
-        // into the corner when the window has only a bare title bar. None of it is drawn —
-        // the title bar is transparent and the page runs the full height of the window —
-        // and because the system owns the layout, resizing leaves the lights where they are
-        // with nothing to re-apply.
-        if window.toolbar == nil {
-            window.toolbarStyle = .unified
-            window.toolbar = NSToolbar(identifier: "UzumakiReaderToolbar")
-        }
-
-        applyTrafficLightVisibility(in: window)
-        measureTrafficLights(in: window)
-    }
-
-    /// Records where the traffic lights sit, so the control bar can clear them and put its
-    /// own centre line on theirs.
-    ///
-    /// The room they take is measured in full screen as well: macOS reveals the window's
-    /// toolbar — and the lights with it — when the pointer goes to the top of the display,
-    /// and the controls need to have moved over by then.
-    private func measureTrafficLights(in window: NSWindow) {
-        let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
-            .compactMap { window.standardWindowButton($0) }
-
-        guard let close = buttons.first, let last = buttons.last else {
-            trafficLightCentre = nil
-            trafficLightSpan = 0
-            return
-        }
-
-        // Full screen has no title bar of its own, so there is no centre line to line up
-        // with and the controls fall back to their own inset.
-        trafficLightCentre = window.styleMask.contains(.fullScreen)
-            ? nil
-            : window.frame.height - close.convert(close.bounds, to: nil).midY
-        trafficLightSpan = last.convert(last.bounds, to: nil).maxX + 10
-    }
-
-    /// The window's shape when two pages are read at a time: two of them side by side.
-    private var twoPageAspectRatio: CGFloat {
-        2 * (pageAspect ?? Self.typicalPageAspectRatio)
-    }
-
-    /// A page's width over its height, read from a page of the current spread that has
-    /// loaded. Proportions differ between series, so this is measured rather than assumed
-    /// wherever one is available.
-    private func readPageAspect() async {
-        let grid = spreads
-        guard grid.indices.contains(currentSpreadIndex) else {
-            pageAspect = nil
-            return
-        }
-
-        let maxPixelSize = model.renderMaxPixelSize
-        for page in grid[currentSpreadIndex] {
-            guard let image = await images.cachedImage(for: page.url, maxPixelSize: maxPixelSize),
-                  image.height > 0
-            else { continue }
-            pageAspect = CGFloat(image.width) / CGFloat(image.height)
-            return
-        }
-        pageAspect = nil
-    }
-
-    /// Stand-in proportions, used until a page has loaded.
-    private static let typicalPageAspectRatio: CGFloat = 2.0 / 3.0
-
-    /// Locks the window to the shape of the pages it is showing, so a two-page spread fills
-    /// it instead of being letterboxed inside it.
-    ///
-    /// Released whenever two pages are not being read at a time, and in full screen, where
-    /// an aspect ratio would fight the window filling the display.
-    ///
-    /// `resizing` also resizes the window to take the shape on. That is only safe once the
-    /// window is settled, so the full screen transitions never ask for it — resizing the
-    /// window while it is coming out of full screen hangs it, and a ratio that changed while
-    /// it was away is not a reason to do it then.
-    private func applyWindowShape(resizing: Bool = false) {
-        guard let window else { return }
-        guard settings.layout == .horizontal,
-              settings.pageMode == .double,
-              !window.styleMask.contains(.fullScreen)
-        else {
-            appliedAspectRatio = 0
-            window.contentAspectRatio = .zero
-            return
-        }
-
-        let ratio = twoPageAspectRatio
-        window.contentAspectRatio = NSSize(width: ratio, height: 1)
-
-        // Take the shape on when it is first applied or whenever the pages' proportions turn
-        // out to be different, keeping the width.
-        guard resizing, ratio != appliedAspectRatio else { return }
-        appliedAspectRatio = ratio
-
-        let width = window.contentRect(forFrameRect: window.frame).width
-        guard width > 0 else { return }
-        window.setContentSize(NSSize(width: width, height: (width / ratio).rounded()))
-    }
-
-    /// The traffic lights go away with the rest of the controls, so a reader with the
-    /// controls put away has nothing on screen but the page. Hidden rather than faded, so
-    /// they cannot be clicked while they cannot be seen.
-    private func applyTrafficLightVisibility(in window: NSWindow) {
-        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(type)?.isHidden = !controlsVisible
-        }
-    }
-
-    /// Applies the remembered window state when the reader opens.
-    private func restoreFullScreenPreference(in window: NSWindow) {
-        let wantsFullScreen = settings.readerFullscreen
-        let isFullScreen = window.styleMask.contains(.fullScreen)
-        guard wantsFullScreen != isFullScreen else { return }
-        window.toggleFullScreen(nil)
     }
 
     // MARK: - Content
@@ -648,9 +570,6 @@ struct ReaderView: View {
     /// An overlay rather than the window's toolbar. A title bar occupies a strip of its
     /// own, so hiding and showing it pushed the page up and down underneath it; drawn over
     /// the page means the controls can come and go without the reading position moving.
-    ///
-    /// The bar spans the window and the traffic lights sit in it, with the controls
-    /// gathered into rounded groups beside them.
     private var controlBar: some View {
         GlassEffectContainer(spacing: 12) {
             HStack(spacing: 12) {
@@ -686,10 +605,21 @@ struct ReaderView: View {
     }
 
     /// Puts the control bar's centre line on the traffic lights' centre line, so the lights
-    /// read as part of the bar rather than floating above it.
+    /// read as part of the bar rather than floating above it. Full screen has no title bar
+    /// to line up with, so the bar falls back to its own inset there.
     private var controlBarTopPadding: CGFloat {
         guard let centre = trafficLightCentre, controlBarHeight > 0 else { return 8 }
         return max(0, centre - controlBarHeight / 2)
+    }
+
+    /// The height of the display's camera housing, or zero when the display has none.
+    /// Only a notched Mac reserves space at the top of the screen, so its auxiliary
+    /// areas being present is what distinguishes it from an ordinary display.
+    private var notchInset: CGFloat {
+        guard let screen = window?.screen,
+              screen.auxiliaryTopLeftArea != nil
+        else { return 0 }
+        return screen.safeAreaInsets.top
     }
 
     /// Puts a run of controls on one piece of glass, the way a toolbar groups them.
@@ -712,7 +642,6 @@ struct ReaderView: View {
         } label: {
             Label("Close", systemImage: "xmark")
         }
-        .keyboardShortcut(.escape, modifiers: [])
         .help("Close")
     }
 
@@ -755,6 +684,10 @@ struct ReaderView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .glassEffect()
+        // The camera housing sits over the middle of the screen and only in full
+        // screen; the rest of the bar is beside it, so the title alone steps down
+        // out of the notch. Displays without a notch are left alone.
+        .offset(y: isReaderFullScreen ? notchInset : 0)
     }
 
     private var bookmarkControl: some View {
@@ -880,12 +813,157 @@ struct ReaderView: View {
     }
 
     private func toggleFullScreen() {
-        (window ?? NSApp.keyWindow ?? NSApp.mainWindow)?.toggleFullScreen(nil)
+        guard let window else { return }
+        if isReaderFullScreen {
+            exitReaderFullScreen(window)
+        } else {
+            enterReaderFullScreen(window)
+        }
+    }
+
+    /// Makes the reader window borderless: no title bar of its own, and the page drawn from
+    /// the very top edge with the traffic lights floating over it.
+    ///
+    /// `.windowStyle(.hiddenTitleBar)` hides the title but still reserves the title bar's
+    /// height, which is what left a bar across the top of the window. `fullSizeContentView`
+    /// is what lets the content into that space.
+    private func makeBorderless(_ window: NSWindow) {
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.styleMask.insert(.fullSizeContentView)
+        window.titlebarSeparatorStyle = .none
+
+        // The reader fills the screen itself rather than through AppKit's full screen.
+        // Taking the native transition away from this window also disables the green
+        // button's full screen and the menu item, so the path that wedges on exit
+        // cannot be reached at all.
+        window.collectionBehavior.insert(.fullScreenNone)
+        window.collectionBehavior.remove(.fullScreenPrimary)
+
+        // An empty unified toolbar is what gives the traffic lights their ordinary
+        // spacing away from the top-left corner; a toolbar-less window tucks them into
+        // the corner. Nothing is drawn in it — the title bar is transparent and the
+        // separator is off — it only owns the lights' layout.
+        if window.toolbar == nil {
+            window.toolbarStyle = .unified
+            window.toolbar = NSToolbar(identifier: "UzumakiReaderToolbar")
+        }
+
+        reconcileWindow(window)
+    }
+
+    /// Records where the traffic lights sit, so the control bar can clear them and put its
+    /// own centre line on theirs.
+    private func measureTrafficLights(in window: NSWindow) {
+        let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
+            .compactMap { window.standardWindowButton($0) }
+
+        guard let close = buttons.first, let last = buttons.last else {
+            trafficLightCentre = nil
+            trafficLightSpan = 0
+            return
+        }
+
+        // A screen-filling window has its title bar hidden with the rest of the system
+        // chrome, so there is no centre line to line up with and no room to clear.
+        guard !isReaderFullScreen else {
+            trafficLightCentre = nil
+            trafficLightSpan = 0
+            return
+        }
+
+        trafficLightCentre = window.frame.height - close.convert(close.bounds, to: nil).midY
+        trafficLightSpan = last.convert(last.bounds, to: nil).maxX + 10
+    }
+
+    /// The traffic lights go away with the rest of the controls, so a reader with the
+    /// controls put away has nothing on screen but the page. Hidden rather than faded, so
+    /// they cannot be clicked while they cannot be seen. They are always gone while the
+    /// reader fills the screen, where they would otherwise float over the page.
+    private func applyTrafficLightVisibility(in window: NSWindow) {
+        let hidden = isReaderFullScreen || !controlsVisible
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(type)?.isHidden = hidden
+        }
+    }
+
+    /// Puts the window chrome back in step with the reader: the traffic lights, the room
+    /// they take, and the window's shape. Every window mutation goes through here.
+    private func reconcileWindow(_ window: NSWindow, resizingWindowShape: Bool = false) {
+        measureTrafficLights(in: window)
+        applyTrafficLightVisibility(in: window)
+        applyWindowShape(resizing: resizingWindowShape)
+    }
+
+    /// The window's shape when two pages are read at a time: two of them side by side.
+    private var twoPageAspectRatio: CGFloat {
+        2 * (pageAspect ?? Self.typicalPageAspectRatio)
+    }
+
+    /// A page's width over its height, read from a page of the current spread that has
+    /// loaded. Proportions differ between series, so this is measured rather than assumed
+    /// wherever one is available.
+    private func readPageAspect() async {
+        let grid = spreads
+        guard grid.indices.contains(currentSpreadIndex) else {
+            pageAspect = nil
+            return
+        }
+
+        let maxPixelSize = model.renderMaxPixelSize
+        for page in grid[currentSpreadIndex] {
+            guard let image = await images.cachedImage(for: page.url, maxPixelSize: maxPixelSize),
+                  image.height > 0
+            else { continue }
+            pageAspect = CGFloat(image.width) / CGFloat(image.height)
+            return
+        }
+        pageAspect = nil
+    }
+
+    /// Stand-in proportions, used until a page has loaded.
+    private static let typicalPageAspectRatio: CGFloat = 2.0 / 3.0
+
+    /// Locks the window to the shape of the pages it is showing, so a two-page spread fills
+    /// it instead of being letterboxed inside it.
+    ///
+    /// Released whenever two pages are not being read at a time, and around full screen:
+    /// the ratio is dropped before entering and re-applied once the window is windowed
+    /// again, because an aspect ratio would fight the window filling the display.
+    ///
+    /// `resizing` also resizes the window to take the shape on. That is only safe once the
+    /// window is settled, so the full screen transitions never ask for it — resizing the
+    /// window while it is coming out of full screen hangs it, and a ratio that changed while
+    /// it was away is not a reason to do it then.
+    private func applyWindowShape(resizing: Bool = false) {
+        guard let window else { return }
+        // The screen-filling window is not shaped to the page; the lock is dropped on
+        // entry and re-applied when the window is back at its windowed size.
+        guard !isReaderFullScreen, !window.styleMask.contains(.fullScreen) else { return }
+        guard settings.layout == .horizontal,
+              settings.pageMode == .double
+        else {
+            appliedAspectRatio = 0
+            window.contentAspectRatio = .zero
+            return
+        }
+
+        let ratio = twoPageAspectRatio
+        window.contentAspectRatio = NSSize(width: ratio, height: 1)
+
+        // Take the shape on when it is first applied or whenever the pages' proportions turn
+        // out to be different, keeping the width.
+        guard resizing, ratio != appliedAspectRatio else { return }
+        appliedAspectRatio = ratio
+
+        let width = window.contentRect(forFrameRect: window.frame).width
+        guard width > 0 else { return }
+        window.setContentSize(NSSize(width: width, height: (width / ratio).rounded()))
     }
 }
 
-/// Reports the window hosting the view, so the reader can control full screen
-/// without guessing which window is key.
+/// Reports the window hosting the view, so the reader controls its own window rather
+/// than whichever one happens to be key.
 private struct WindowAccessor: NSViewRepresentable {
     @Binding var window: NSWindow?
 
