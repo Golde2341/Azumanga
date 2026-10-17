@@ -74,6 +74,9 @@ struct ReaderView: View {
     /// The spread on screen, as the id of its first page. Two-way bound to the scroll
     /// view, so a gesture reports where it landed and a keyboard turn can drive it back.
     @State private var spreadPosition: Int?
+    /// Vertical reader page tracking, kept out of observable state so scrolling never
+    /// re-renders or moves the view.
+    @State private var verticalScrollTracker = ReaderVerticalScrollTracker()
     /// The scroll view's live offset, which the paging behavior reads when a gesture ends.
     @State private var scrollOffset = ReaderScrollOffset()
     /// Whether the reader's own controls are on screen. They stay out of the way while
@@ -101,6 +104,10 @@ struct ReaderView: View {
     @State private var scrubFraction: CGFloat = 0
     /// A page's width over its height, once one of them has loaded and can be measured.
     @State private var pageAspect: CGFloat?
+    /// The same proportion, but fixed for the vertical reader's layout. Every page
+    /// reserves a slot of this shape before its image arrives, so an image finishing
+    /// its load can never reflow the stack and move the viewport.
+    @State private var verticalPageAspect: CGFloat?
     /// The shape last put on to the window, so it is only resized when it actually changes.
     @State private var appliedAspectRatio: CGFloat = 0
     /// Distance from the window's top edge down to the traffic lights' centre line, so the
@@ -435,7 +442,16 @@ struct ReaderView: View {
 
         let size = model.renderMaxPixelSize
         Task {
-            _ = try? await images.image(for: firstPage, maxPixelSize: size)
+            // The first page is loaded for the reveal, so this is the earliest point
+            // at which the chapter's proportions can be known. Fixing them here means
+            // the vertical stack is already shaped correctly when the pages arrive.
+            if let image = try? await images.image(for: firstPage, maxPixelSize: size),
+               image.height > 0 {
+                let aspect = CGFloat(image.width) / CGFloat(image.height)
+                if verticalPageAspect == nil {
+                    verticalPageAspect = aspect
+                }
+            }
             finishIntro()
         }
         Task {
@@ -545,31 +561,113 @@ struct ReaderView: View {
             let pageWidth = geometry.size.width
             let zoom = model.zoom
             // Zoom changes the pages' real layout size, so the lazy stack knows
-            // exactly what is on screen. Zoombed out, the stack is the window's width
-            // and the smaller pages sit centred inside it, leaving bars on both sides.
+            // exactly what is on screen. Compared to scaling the scroll view, this
+            // also keeps lazy page loading in step with the viewport.
             let contentWidth = max(pageWidth, pageWidth * zoom)
+            // Every page gets the same reserved shape. The image is fitted inside it,
+            // so going from placeholder to decoded page cannot change the stack's
+            // height — the reflow that used to shove the scroll view into the previous
+            // page is gone.
+            let reservedAspect = min(max(verticalPageAspect ?? Self.typicalPageAspectRatio, 0.2), 5)
+            let pageHeight = (pageWidth * zoom) / reservedAspect
 
-            ScrollView([.vertical, .horizontal]) {
-                LazyVStack(spacing: 0) {
-                    ForEach(model.pages) { page in
-                        AsyncPageImage(page: page, maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
-                            .frame(width: pageWidth * zoom)
-                            .id(page.index)
+            ScrollViewReader { proxy in
+                ScrollView([.vertical, .horizontal]) {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.pages) { page in
+                            AsyncPageImage(page: page, maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
+                                .frame(width: pageWidth * zoom, height: pageHeight)
+                                .id(page.index)
+                                .background {
+                                    GeometryReader { pageGeometry in
+                                        Color.clear.preference(
+                                            key: ReaderVerticalPageTopsKey.self,
+                                            value: [
+                                                page.index: pageGeometry
+                                                    .frame(in: .named("verticalReader"))
+                                                    .minY
+                                            ]
+                                        )
+                                    }
+                                }
+                        }
+                    }
+                    .frame(width: contentWidth)
+                    // Inside the scroll content, so it is definitely the scroll view
+                    // containing it that gets found.
+                    .background(ScrollViewAccessor(scrollView: $verticalScrollView))
+                }
+                .coordinateSpace(.named("verticalReader"))
+                // The page on screen is read from geometry. Binding the scroll
+                // position to the model made SwiftUI re-anchor the page — and jump —
+                // whenever scrolling updated the model.
+                .onPreferenceChange(ReaderVerticalPageTopsKey.self) { tops in
+                    trackVerticalPage(tops)
+                }
+                .onScrollPhaseChange { oldPhase, phase in
+                    verticalScrollTracker.isUserScrolling = phase == .tracking
+                        || phase == .interacting
+                        || phase == .decelerating
+                    // The model is only brought up to date when the gesture ends;
+                    // nothing re-renders the reader while it is scrolling.
+                    if oldPhase != .idle, phase == .idle {
+                        applyTrackedVerticalPage()
                     }
                 }
-                .frame(width: contentWidth)
-                .scrollTargetLayout()
-                // Inside the scroll content, so it is definitely the scroll view
-                // containing it that gets found.
-                .background(ScrollViewAccessor(scrollView: $verticalScrollView))
-            }
-            .scrollPosition(id: positionBinding)
-            .scrollIndicators(.never)
-            .gesture(verticalZoomGesture)
-            .onTapGesture(count: 2) {
-                model.zoom > 1 ? model.resetZoom() : model.setZoom(2)
+                // Only a model change that did not come from scrolling moves the
+                // view: keyboard turns, the scrubber and chapter navigation.
+                .onChange(of: model.currentIndex) { _, newValue in
+                    guard !verticalScrollTracker.isUserScrolling,
+                          newValue != verticalScrollTracker.lastAppliedIndex
+                    else { return }
+                    verticalScrollTracker.topPageIndex = newValue
+                    verticalScrollTracker.lastAppliedIndex = newValue
+                    proxy.scrollTo(newValue, anchor: .top)
+                }
+                .onChange(of: model.pages) { _, _ in
+                    Task { @MainActor in
+                        verticalScrollTracker.topPageIndex = model.currentIndex
+                        verticalScrollTracker.lastAppliedIndex = model.currentIndex
+                        proxy.scrollTo(model.currentIndex, anchor: .top)
+                    }
+                }
+                .onAppear {
+                    Task { @MainActor in
+                        verticalScrollTracker.topPageIndex = model.currentIndex
+                        verticalScrollTracker.lastAppliedIndex = model.currentIndex
+                        proxy.scrollTo(model.currentIndex, anchor: .top)
+                    }
+                }
+                .scrollIndicators(.never)
+                .gesture(verticalZoomGesture)
+                .onTapGesture(count: 2) {
+                    model.zoom > 1 ? model.resetZoom() : model.setZoom(2)
+                }
             }
         }
+    }
+
+    /// The page whose top edge most recently crossed the viewport's top edge. It is
+    /// only recorded here; the model follows when the scroll ends.
+    private func trackVerticalPage(_ tops: [Int: CGFloat]) {
+        guard !isMagnifying, !tops.isEmpty else { return }
+
+        let visible = tops
+            .filter { $0.value <= 1 }
+            .max { $0.value < $1.value }
+            ?? tops.min { $0.value < $1.value }
+
+        guard let index = visible?.key else { return }
+        verticalScrollTracker.topPageIndex = index
+    }
+
+    private func applyTrackedVerticalPage() {
+        guard let index = verticalScrollTracker.topPageIndex,
+              index != model.currentIndex
+        else { return }
+
+        verticalScrollTracker.lastAppliedIndex = index
+        model.goToPage(index, resetZoom: false)
     }
 
     /// Horizontal paging is the platform's scroll view with one custom decision about
@@ -684,20 +782,6 @@ struct ReaderView: View {
             model.pages,
             pageMode: settings.pageMode,
             firstPageAlone: settings.doublePageFirstPageAlone
-        )
-    }
-
-    private var positionBinding: Binding<Int?> {
-        Binding(
-            get: { model.currentIndex },
-            set: { newValue in
-                // Magnifying changes every page's width, which shifts the scroll
-                // view's idea of the current page. Those intermediate positions are
-                // not page turns: feeding them back made the reader fight itself,
-                // flicker between placeholder and page, and jump up and down.
-                guard !isMagnifying, let newValue else { return }
-                model.goToPage(newValue, resetZoom: false)
-            }
         )
     }
 
@@ -1307,7 +1391,13 @@ struct ReaderView: View {
             guard let image = await images.cachedImage(for: page.url, maxPixelSize: maxPixelSize),
                   image.height > 0
             else { continue }
-            pageAspect = CGFloat(image.width) / CGFloat(image.height)
+            let aspect = CGFloat(image.width) / CGFloat(image.height)
+            pageAspect = aspect
+            // The vertical stack's slot shape is chosen once and then kept. Letting it
+            // follow the current page would resize every page in the chapter mid-read.
+            if verticalPageAspect == nil {
+                verticalPageAspect = aspect
+            }
             return
         }
         pageAspect = nil
@@ -1498,6 +1588,23 @@ private struct ReaderResizeGrip: NSViewRepresentable {
             didDrag = false
             onEnded?()
         }
+    }
+}
+
+/// Vertical reader page tracking that does not invalidate the view when it changes.
+private final class ReaderVerticalScrollTracker {
+    var topPageIndex: Int?
+    var lastAppliedIndex: Int?
+    var isUserScrolling = false
+}
+
+/// The top edge of every realized page in the vertical reader, in the scroll view's
+/// coordinate space.
+private struct ReaderVerticalPageTopsKey: PreferenceKey {
+    static var defaultValue: [Int: CGFloat] = [:]
+
+    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
 }
 
