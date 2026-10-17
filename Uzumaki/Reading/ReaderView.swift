@@ -39,10 +39,10 @@ struct ReaderContainerView: View {
 /// keyboard shortcuts, chapter navigation and automatic progress saving.
 ///
 /// The window itself is managed by the scene (`.windowStyle(.hiddenTitleBar)` in
-/// `UzumakiApp.swift`). The reader fills the screen with a plain window frame change
-/// rather than AppKit's native full screen, which on macOS 26/27 can wedge the window
-/// on exit. Window chrome (traffic lights, page shape) is only applied from
-/// `reconcileWindow`.
+/// `UzumakiApp.swift`). Full screen is available two ways: AppKit's native full screen
+/// (green button, View menu) and the reader's own screen-filling mode (`F`), which does
+/// not use the native transition at all. Window chrome (traffic lights, page shape) is
+/// only applied from `reconcileWindow`.
 struct ReaderView: View {
     @Bindable var model: ReaderModel
 
@@ -54,11 +54,16 @@ struct ReaderView: View {
     /// The window hosting the reader, used to drive full screen and measure traffic lights.
     @State private var window: NSWindow?
     /// Whether the reader is filling the screen in its own windowed mode. The reader
-    /// deliberately does not use AppKit's native full screen: on macOS 26/27 the native
-    /// transition can wedge the window on exit, and the reader window is the one thing
-    /// that cannot be rebuilt. This mode only sizes the window and hides the system
-    /// chrome, which the window server handles as an ordinary resize.
+    /// keeps this alongside AppKit's native full screen; the two never overlap.
     @State private var isReaderFullScreen = false
+    /// Whether AppKit's own full screen is active.
+    @State private var isNativeFullScreen = false
+    /// Whether AppKit is mid-transition into or out of native full screen. Window chrome
+    /// is left alone for the whole transition.
+    @State private var isNativeFullScreenTransition = false
+    /// Counts native full screen transitions, so a settle that finishes late cannot
+    /// clear the flag for a transition that has started since.
+    @State private var nativeFullScreenGeneration = 0
     /// The window's frame from before it filled the screen, restored when leaving.
     @State private var windowedFrame: NSRect?
     /// The window's size limits from before it filled the screen. While filling the
@@ -128,6 +133,9 @@ struct ReaderView: View {
         // height of a title bar above the content, which reads as a bar across the top even
         // though no title is drawn in it.
         .ignoresSafeArea(.container, edges: .top)
+        // In native full screen the window's toolbar only exists for the traffic
+        // lights' spacing, so keep it out of the way until the pointer asks for it.
+        .windowToolbarFullScreenVisibility(.onHover)
         // The traffic lights follow the controls, so a reader with the controls put
         // away has nothing on screen but the page.
         .onChange(of: controlsVisible) { _, _ in
@@ -214,6 +222,58 @@ struct ReaderView: View {
             guard let window else { return }
             reconcileWindow(window, resizingWindowShape: true)
         }
+        // Native full screen is tracked separately from the reader's own screen-filling
+        // mode. Nothing is done to the window from `will…` until the transition has
+        // unwound, so AppKit never has to reconcile the reader while it is capturing
+        // and restoring the window.
+        .task(id: window) {
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.willEnterFullScreenNotification,
+                object: window
+            ) {
+                beginNativeFullScreenTransition()
+            }
+        }
+        .task(id: window) {
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.didEnterFullScreenNotification,
+                object: window
+            ) {
+                settings.readerFullscreen = true
+                isNativeFullScreen = true
+                isNativeFullScreenTransition = false
+            }
+        }
+        .task(id: window) {
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.willExitFullScreenNotification,
+                object: window
+            ) {
+                beginNativeFullScreenTransition()
+            }
+        }
+        .task(id: window) {
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.didExitFullScreenNotification,
+                object: window
+            ) {
+                settings.readerFullscreen = false
+                isNativeFullScreen = false
+                // `didExit` is posted while AppKit is still putting the window back
+                // together; the chrome is applied once the notification has unwound.
+                let generation = nativeFullScreenGeneration
+                Task {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    guard generation == nativeFullScreenGeneration else { return }
+                    isNativeFullScreenTransition = false
+                    reconcileWindow(window)
+                }
+            }
+        }
         .onDisappear {
             // Presentation options are app-wide, so full screen must not outlive the view.
             if isReaderFullScreen, NSApp.isActive {
@@ -221,6 +281,13 @@ struct ReaderView: View {
             }
             model.flushProgress()
         }
+    }
+
+    /// Marks AppKit's native full screen transition as in flight. Window chrome is left
+    /// alone until the matching `did…` notification has unwound.
+    private func beginNativeFullScreenTransition() {
+        nativeFullScreenGeneration += 1
+        isNativeFullScreenTransition = true
     }
 
     /// Fills the screen with the reader without involving AppKit's full screen.
@@ -243,6 +310,11 @@ struct ReaderView: View {
         window.minSize = screen.frame.size
         window.maxSize = screen.frame.size
 
+        // Native full screen is not available while the reader is filling the screen
+        // itself; the green button zooms instead. It comes back on exit.
+        window.collectionBehavior.insert(.fullScreenNone)
+        window.collectionBehavior.remove(.fullScreenPrimary)
+
         if NSApp.isActive {
             NSApp.presentationOptions = [.autoHideMenuBar, .autoHideDock]
         }
@@ -257,6 +329,8 @@ struct ReaderView: View {
         guard isReaderFullScreen else { return }
         isReaderFullScreen = false
         settings.readerFullscreen = false
+        window.collectionBehavior.remove(.fullScreenNone)
+        window.collectionBehavior.insert(.fullScreenPrimary)
 
         if NSApp.isActive {
             NSApp.presentationOptions = savedPresentationOptions
@@ -608,7 +682,10 @@ struct ReaderView: View {
     /// read as part of the bar rather than floating above it. Full screen has no title bar
     /// to line up with, so the bar falls back to its own inset there.
     private var controlBarTopPadding: CGFloat {
-        guard let centre = trafficLightCentre, controlBarHeight > 0 else { return 8 }
+        guard !isNativeFullScreen,
+              let centre = trafficLightCentre,
+              controlBarHeight > 0
+        else { return 8 }
         return max(0, centre - controlBarHeight / 2)
     }
 
@@ -685,9 +762,9 @@ struct ReaderView: View {
         .padding(.vertical, 6)
         .glassEffect()
         // The camera housing sits over the middle of the screen and only in full
-        // screen; the rest of the bar is beside it, so the title alone steps down
-        // out of the notch. Displays without a notch are left alone.
-        .offset(y: isReaderFullScreen ? notchInset : 0)
+        // screen, native or the reader's own; the rest of the bar is beside it, so the
+        // title alone steps down out of the notch. Displays without one are left alone.
+        .offset(y: (isReaderFullScreen || isNativeFullScreen) ? notchInset : 0)
     }
 
     private var bookmarkControl: some View {
@@ -721,7 +798,7 @@ struct ReaderView: View {
         } label: {
             Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
         }
-        .help("Full screen")
+        .help("Exclusive full screen (F) — the green button uses native full screen")
     }
 
     // MARK: - Display options
@@ -813,7 +890,14 @@ struct ReaderView: View {
     }
 
     private func toggleFullScreen() {
-        guard let window else { return }
+        // The green button and the View menu own native full screen; this toggle is the
+        // reader's own screen-filling mode, and the two do not overlap.
+        guard let window,
+              !isNativeFullScreen,
+              !isNativeFullScreenTransition,
+              !window.styleMask.contains(.fullScreen)
+        else { return }
+
         if isReaderFullScreen {
             exitReaderFullScreen(window)
         } else {
@@ -833,12 +917,10 @@ struct ReaderView: View {
         window.styleMask.insert(.fullSizeContentView)
         window.titlebarSeparatorStyle = .none
 
-        // The reader fills the screen itself rather than through AppKit's full screen.
-        // Taking the native transition away from this window also disables the green
-        // button's full screen and the menu item, so the path that wedges on exit
-        // cannot be reached at all.
-        window.collectionBehavior.insert(.fullScreenNone)
-        window.collectionBehavior.remove(.fullScreenPrimary)
+        // Native full screen stays available: the green button and the View menu use it.
+        // The reader leaves the transition entirely to AppKit — nothing here or in the
+        // notification handlers touches the window until it is windowed again.
+        window.collectionBehavior.insert(.fullScreenPrimary)
 
         // An empty unified toolbar is what gives the traffic lights their ordinary
         // spacing away from the top-left corner; a toolbar-less window tucks them into
@@ -890,6 +972,7 @@ struct ReaderView: View {
     /// Puts the window chrome back in step with the reader: the traffic lights, the room
     /// they take, and the window's shape. Every window mutation goes through here.
     private func reconcileWindow(_ window: NSWindow, resizingWindowShape: Bool = false) {
+        guard !isNativeFullScreen, !isNativeFullScreenTransition else { return }
         measureTrafficLights(in: window)
         applyTrafficLightVisibility(in: window)
         applyWindowShape(resizing: resizingWindowShape)
