@@ -1,4 +1,4 @@
-# Uzumaki parser host
+# Azumanga parser host
 
 An out-of-process JVM process that runs the [Kotatsu parser
 library](https://github.com/Kotatsu-Redo/kotatsu-parsers-redo) and exposes it to
@@ -20,10 +20,10 @@ macOS — browse, search, details, and page resolution.
 
 | Path | Purpose |
 | --- | --- |
-| `src/main/kotlin/uzumaki/host/Main.kt` | stdio loop, NDJSON framing |
-| `src/main/kotlin/uzumaki/host/ParserHost.kt` | method dispatch and model mapping |
-| `src/main/kotlin/uzumaki/host/HostContext.kt` | `MangaLoaderContext` implementation (OkHttp, cookies, AWT bitmaps) |
-| `src/main/kotlin/uzumaki/host/Json.kt` | small JSON helpers |
+| `src/main/kotlin/azumanga/host/Main.kt` | stdio loop, NDJSON framing |
+| `src/main/kotlin/azumanga/host/ParserHost.kt` | method dispatch and model mapping |
+| `src/main/kotlin/azumanga/host/HostContext.kt` | `MangaLoaderContext` implementation (OkHttp, cookies, AWT bitmaps) |
+| `src/main/kotlin/azumanga/host/Json.kt` | small JSON helpers |
 
 ## Prerequisites
 
@@ -49,7 +49,7 @@ cd /path/to/kotatsu-parsers-redo-master
 
 ```sh
 cd ParserHost
-./gradlew fatJar                  # build/libs/uzumaki-parser-host-all.jar
+./gradlew fatJar                  # build/libs/azumanga-parser-host-all.jar
 ```
 
 The fat jar exists because the bundled runtime ships no third-party jars.
@@ -76,15 +76,15 @@ the failure mode is a `NoClassDefFoundError` at runtime, not at build time.
 ```sh
 printf '%s\n%s\n' '{"id":1,"method":"ping"}' \
   '{"id":2,"method":"list","params":{"key":"MANGAPILL","offset":0,"query":"berserk"}}' \
-  | ./runtime/bin/java -jar build/libs/uzumaki-parser-host-all.jar
+  | ./runtime/bin/java -jar build/libs/azumanga-parser-host-all.jar
 ```
 
 Bundled layout the app expects:
 
 ```
-Uzumaki.app/Contents/Resources/ParserHost/
+Azumanga.app/Contents/Resources/ParserHost/
   runtime/                      # jlink output
-  uzumaki-parser-host-all.jar
+  azumanga-parser-host-all.jar
 ```
 
 Shipping this means signing every Mach-O in `runtime/` with your team ID and

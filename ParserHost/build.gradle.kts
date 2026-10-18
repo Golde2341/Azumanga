@@ -20,7 +20,7 @@ dependencies {
 }
 
 application {
-    mainClass.set("uzumaki.host.MainKt")
+    mainClass.set("azumanga.host.MainKt")
 }
 
 /**
@@ -35,7 +35,7 @@ tasks.register<Jar>("fatJar") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
     manifest {
-        attributes["Main-Class"] = "uzumaki.host.MainKt"
+        attributes["Main-Class"] = "azumanga.host.MainKt"
     }
 
     from(sourceSets.main.get().output)

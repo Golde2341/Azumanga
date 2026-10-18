@@ -1,6 +1,6 @@
-# Uzumaki Provider API
+# Azumanga Provider API
 
-A **provider** (or *source*) teaches Uzumaki how to talk to a manga site. Providers
+A **provider** (or *source*) teaches Azumanga how to talk to a manga site. Providers
 are plain JavaScript, installed at runtime — you never rebuild or modify the app
 to add one.
 
@@ -26,7 +26,7 @@ provider were running next to yours.
   not claim another provider's id, use path separators, or reference a script
   outside its own directory.
 * Installed providers live in
-  `~/Library/Application Support/Uzumaki/Sources/<id>/` and can be removed at any
+  `~/Library/Application Support/Azumanga/Sources/<id>/` and can be removed at any
   time from **Settings ▸ Sources**.
 
 Because a provider is only as trustworthy as its author, only install providers
@@ -233,7 +233,7 @@ without rebuilding anything, and read it as a starting point:
 2. **Browse** — check `popular`/`latest` load and paginate (`hasNextPage`).
 3. **Search** — check queries and filters arrive as expected.
 4. Open a title, then a chapter, and confirm images render.
-5. Check `console.log` output in the app log (Console.app, subsystem `org.uzumaki`,
+5. Check `console.log` output in the app log (Console.app, subsystem `org.azumanga`,
    category `providers`) when something misbehaves.
 
 If a provider fails to load, the Sources screen reports the reason; malformed

@@ -1,4 +1,4 @@
-rootProject.name = "uzumaki-parser-host"
+rootProject.name = "azumanga-parser-host"
 
 dependencyResolutionManagement {
     repositories {
