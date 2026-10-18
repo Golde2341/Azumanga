@@ -74,7 +74,7 @@ nonisolated enum PageBackground: String, CaseIterable, Identifiable, Sendable, C
     var displayName: String {
         switch self {
         case .black: "Black"
-        case .darkGray: "Dark gray"
+        case .darkGray: "Gray"
         case .white: "White"
         }
     }

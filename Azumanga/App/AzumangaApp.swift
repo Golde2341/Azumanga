@@ -59,6 +59,7 @@ private extension View {
         self
             .environment(app)
             .environment(app.settings)
+            .environment(app.mangaViewOptions)
             .environment(app.services)
             .environment(app.library)
             .environment(app.discovery)

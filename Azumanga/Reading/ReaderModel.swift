@@ -35,6 +35,7 @@ final class ReaderModel {
 
     private let services: Services
     private let settings: SettingsStore
+    private let viewOptions: ReaderViewOptions?
     private let startPageIndex: Int?
     /// True when the reader was opened without a chapter list (library Force Touch,
     /// bookmarks, Downloads). The list is fetched in the background so next/previous
@@ -49,7 +50,8 @@ final class ReaderModel {
         startChapterId: String,
         startPageIndex: Int? = nil,
         services: Services,
-        settings: SettingsStore
+        settings: SettingsStore,
+        viewOptions: ReaderViewOptions? = nil
     ) {
         self.manga = manga
         self.startPageIndex = startPageIndex
@@ -76,11 +78,12 @@ final class ReaderModel {
         }
         self.services = services
         self.settings = settings
+        self.viewOptions = viewOptions
     }
 
     /// Decoded size cap. Larger values look sharper at the cost of memory.
     var renderMaxPixelSize: Int {
-        settings.fitMode == .original ? 4096 : 1600
+        (viewOptions?.fitMode ?? settings.fitMode) == .original ? 4096 : 1600
     }
 
     var chapter: Chapter {

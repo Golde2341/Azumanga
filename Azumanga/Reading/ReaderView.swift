@@ -8,28 +8,37 @@ struct ReaderContainerView: View {
 
     @Environment(Services.self) private var services
     @Environment(SettingsStore.self) private var settings
+    @Environment(MangaViewOptionsStore.self) private var mangaViewOptions
 
     @State private var model: ReaderModel?
+    @State private var viewOptions: ReaderViewOptions?
 
     var body: some View {
         Group {
-            if let model {
-                ReaderView(model: model)
+            if let model, let viewOptions {
+                ReaderView(model: model, viewOptions: viewOptions)
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .task {
-            guard model == nil else { return }
+            guard model == nil, viewOptions == nil else { return }
+            let viewOptions = ReaderViewOptions(
+                manga: session.manga,
+                defaults: settings,
+                store: mangaViewOptions
+            )
             let model = ReaderModel(
                 manga: session.manga,
                 chapters: session.chapters,
                 startChapterId: session.chapterId,
                 startPageIndex: session.startPageIndex,
                 services: services,
-                settings: settings
+                settings: settings,
+                viewOptions: viewOptions
             )
+            self.viewOptions = viewOptions
             self.model = model
             await model.load()
         }
@@ -46,6 +55,7 @@ struct ReaderContainerView: View {
 /// only applied from `reconcileWindow`.
 struct ReaderView: View {
     @Bindable var model: ReaderModel
+    @Bindable var viewOptions: ReaderViewOptions
 
     @Environment(SettingsStore.self) private var settings
     @Environment(\.dismiss) private var dismiss
@@ -182,7 +192,7 @@ struct ReaderView: View {
 
     var body: some View {
         ZStack {
-            settings.backgroundColor
+            viewOptions.background.color
                 .ignoresSafeArea()
 
             content
@@ -297,10 +307,26 @@ struct ReaderView: View {
         .onKeyPress(.space) { turnSpread(1); return .handled }
         .onKeyPress(.pageUp) { turnSpread(-1); return .handled }
         .onKeyPress(.pageDown) { turnSpread(1); return .handled }
-        .onKeyPress("+") { model.zoomIn(); return .handled }
-        .onKeyPress("=") { model.zoomIn(); return .handled }
-        .onKeyPress("-") { model.zoomOut(); return .handled }
-        .onKeyPress("0") { model.resetZoom(); return .handled }
+        .onKeyPress("+") {
+            guard viewOptions.layout == .vertical else { return .handled }
+            model.zoomIn()
+            return .handled
+        }
+        .onKeyPress("=") {
+            guard viewOptions.layout == .vertical else { return .handled }
+            model.zoomIn()
+            return .handled
+        }
+        .onKeyPress("-") {
+            guard viewOptions.layout == .vertical else { return .handled }
+            model.zoomOut()
+            return .handled
+        }
+        .onKeyPress("0") {
+            guard viewOptions.layout == .vertical else { return .handled }
+            model.resetZoom()
+            return .handled
+        }
         .onKeyPress("[") { goToAdjacentChapter(-1); return .handled }
         .onKeyPress("]") { goToAdjacentChapter(1); return .handled }
         .onKeyPress("b") { model.toggleBookmark(); return .handled }
@@ -347,7 +373,7 @@ struct ReaderView: View {
         .onChange(of: isNativeFullScreenTransition) { _, _ in
             updateWindowResizeLock()
         }
-        .onChange(of: settings.layout) { _, newLayout in
+        .onChange(of: viewOptions.layout) { _, newLayout in
             if newLayout == .vertical {
                 // Releasing the lock must not wait on full-screen bookkeeping; this
                 // only clears the ratio and any stuck size limit, it never resizes.
@@ -363,12 +389,13 @@ struct ReaderView: View {
                 }
             }
             if newLayout == .horizontal {
+                model.resetZoom()
                 beginEpisodeShapeSampling()
             }
             guard let window else { return }
             reconcileWindow(window, resizingWindowShape: true)
         }
-        .onChange(of: settings.pageMode) { _, _ in
+        .onChange(of: viewOptions.pageMode) { _, _ in
             updateWindowResizeLock()
             guard let window else { return }
             reconcileWindow(window, resizingWindowShape: true)
@@ -456,7 +483,7 @@ struct ReaderView: View {
                 named: NSWindow.willStartLiveResizeNotification,
                 object: window
             ) {
-                guard settings.layout == .vertical,
+                guard viewOptions.layout == .vertical,
                       !isReaderFullScreen,
                       !isNativeFullScreen,
                       !isNativeFullScreenTransition,
@@ -864,7 +891,7 @@ struct ReaderView: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            switch settings.layout {
+            switch viewOptions.layout {
             case .vertical:
                 verticalReader
             case .horizontal:
@@ -1144,7 +1171,7 @@ struct ReaderView: View {
         let chapterId = model.chapter.chapterId
         if let existing = sections.first(where: { $0.chapterId == chapterId }),
            existing.pages == model.pages {
-            if settings.layout == .vertical,
+            if viewOptions.layout == .vertical,
                !verticalScrollTracker.isUserScrolling,
                !verticalScrollTracker.isApplyingModelChange,
                let id = currentVerticalPageID,
@@ -1171,7 +1198,7 @@ struct ReaderView: View {
         loadingSectionID = nil
         failedSectionID = nil
 
-        if settings.layout == .vertical, let id = currentVerticalPageID {
+        if viewOptions.layout == .vertical, let id = currentVerticalPageID {
             verticalScrollTracker.topPageID = id
             verticalScrollTracker.lastAppliedPageID = id
             verticalScrollTracker.isRestoring = true
@@ -1318,14 +1345,8 @@ struct ReaderView: View {
             .scrollTargetBehavior(ReaderPagingBehavior(pageWidth: size.width, offset: scrollOffset))
             .scrollPosition(id: $spreadPosition, anchor: .center)
             .scrollIndicators(.never)
-            // A zoomed page needs the drag to pan it rather than to turn the page.
-            .scrollDisabled(model.zoom > 1)
             // Right to left reverses the axis, which is exactly what manga wants.
-            .environment(\.layoutDirection, settings.direction == .rightToLeft ? .rightToLeft : .leftToRight)
-            .gesture(zoomGesture)
-            .onTapGesture(count: 2) {
-                model.zoom > 1 ? model.resetZoom() : model.setZoom(2)
-            }
+            .environment(\.layoutDirection, viewOptions.direction == .rightToLeft ? .rightToLeft : .leftToRight)
             // Where the fingers let go is only knowable here, so it is passed to the
             // behavior rather than left to the momentum the scroll view would project.
             .onScrollGeometryChange(for: CGFloat.self) { geometry in
@@ -1354,7 +1375,7 @@ struct ReaderView: View {
             .onChange(of: currentHorizontalItemID) { _, _ in
                 syncHorizontalPosition(animated: spreadPosition != nil)
             }
-            .onChange(of: settings.pageMode) { _, _ in
+            .onChange(of: viewOptions.pageMode) { _, _ in
                 syncHorizontalPosition(animated: true)
             }
         }
@@ -1367,7 +1388,7 @@ struct ReaderView: View {
         for section in sections {
             let grids = ReaderSpreads.group(
                 section.pages,
-                pageMode: settings.pageMode,
+                pageMode: viewOptions.pageMode,
                 firstPageAlone: settings.doublePageFirstPageAlone
             )
             for grid in grids {
@@ -1417,7 +1438,7 @@ struct ReaderView: View {
 
         let grids = ReaderSpreads.group(
             section.pages,
-            pageMode: settings.pageMode,
+            pageMode: viewOptions.pageMode,
             firstPageAlone: settings.doublePageFirstPageAlone
         )
         guard let index = ReaderSpreads.spreadIndex(showing: model.currentIndex, in: grids),
@@ -1497,7 +1518,7 @@ struct ReaderView: View {
     private var isCurrentChapterOnLastSpread: Bool {
         let grids = ReaderSpreads.group(
             model.pages,
-            pageMode: settings.pageMode,
+            pageMode: viewOptions.pageMode,
             firstPageAlone: settings.doublePageFirstPageAlone
         )
         guard let last = grids.last else { return false }
@@ -1511,13 +1532,13 @@ struct ReaderView: View {
               !isFullScreenAnimating,
               !isPageSyncSuppressed
         else { return }
-        guard settings.layout == .horizontal else {
+        guard viewOptions.layout == .horizontal else {
             turnVerticalPage(direction)
             return
         }
 
         // A reading-order step, which right to left reverses.
-        let step = settings.direction == .rightToLeft ? -direction : direction
+        let step = viewOptions.direction == .rightToLeft ? -direction : direction
         let items = horizontalItems
         let start = items.firstIndex { $0.id == spreadPosition }
             ?? items.firstIndex { $0.id == currentHorizontalItemID }
@@ -1612,7 +1633,7 @@ struct ReaderView: View {
         let targetChapterId = model.chapters[targetIndex].chapterId
 
         if let section = sections.first(where: { $0.chapterId == targetChapterId }) {
-            if settings.layout == .vertical {
+            if viewOptions.layout == .vertical {
                 enterContinuousSection(
                     section,
                     page: direction > 0 ? 0 : max(0, section.pages.count - 1)
@@ -1630,7 +1651,7 @@ struct ReaderView: View {
     private func goToSectionInHorizontal(_ section: ReaderSection, atStart: Bool) {
         let grids = ReaderSpreads.group(
             section.pages,
-            pageMode: settings.pageMode,
+            pageMode: viewOptions.pageMode,
             firstPageAlone: settings.doublePageFirstPageAlone
         )
         guard let pages = (atStart ? grids.first : grids.last),
@@ -1655,7 +1676,8 @@ struct ReaderView: View {
     @ViewBuilder
     private func spreadView(_ pages: [Page], size: CGSize) -> some View {
         if pages.count == 1 {
-            ZoomablePage(page: pages[0], zoom: $model.zoom, maxPixelSize: model.renderMaxPixelSize)
+            AsyncPageImage(page: pages[0], maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
+                .frame(width: size.width, height: size.height)
         } else {
             GeometryReader { inner in
                 HStack(spacing: 0) {
@@ -1665,7 +1687,6 @@ struct ReaderView: View {
                     }
                 }
             }
-            .scaleEffect(model.zoom)
             .frame(width: size.width, height: size.height)
         }
     }
@@ -1674,24 +1695,9 @@ struct ReaderView: View {
     private var spreads: [[Page]] {
         ReaderSpreads.group(
             model.pages,
-            pageMode: settings.pageMode,
+            pageMode: viewOptions.pageMode,
             firstPageAlone: settings.doublePageFirstPageAlone
         )
-    }
-
-    private var zoomGesture: some Gesture {
-        MagnifyGesture()
-            .onChanged { value in
-                if !isMagnifying {
-                    isMagnifying = true
-                    zoomGestureBase = model.zoom
-                }
-                model.setZoom(zoomGestureBase * value.magnification)
-            }
-            .onEnded { _ in
-                zoomGestureBase = model.zoom
-                isMagnifying = false
-            }
     }
 
     /// The vertical reader's pinch. Layout zoom changes every page's height, so the
@@ -2172,9 +2178,17 @@ struct ReaderView: View {
             Label("Display", systemImage: "slider.horizontal.3")
         }
         .popover(isPresented: $showsDisplayOptions, arrowEdge: .top) {
-            displayOptions
+            PerMangaViewOptionsPopover(
+                options: viewOptions,
+                mangaTitle: model.manga.title,
+                onZoomIn: { model.zoomIn() },
+                onZoomOut: { model.zoomOut() },
+                onResetZoom: { model.resetZoom() },
+                onMarkRead: { model.markCurrentChapterRead() },
+                onMarkUnread: { model.markCurrentChapterUnread() }
+            )
         }
-        .help("Reading options")
+        .help("Per manga view options")
     }
 
     private var fullScreenControl: some View {
@@ -2195,94 +2209,6 @@ struct ReaderView: View {
                 ? "Exit full screen (F)"
                 : "Full screen (F) — the green button uses native full screen"
         )
-    }
-
-    // MARK: - Display options
-
-    /// The reader's settings, with the viewing presets at the top.
-    ///
-    /// A popover rather than a menu: a menu renders one row per item and flattens anything
-    /// that is not a menu item, so the presets could only ever have been plain rows. Here
-    /// they are buttons that look like buttons.
-    private var displayOptions: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                ForEach(ReaderPreset.allCases) { preset in
-                    presetButton(preset)
-                }
-            }
-
-            Divider()
-
-            LabeledContent("Layout") {
-                Picker("Layout", selection: binding(get: { $0.layout }, set: { $0.layout = $1 })) {
-                    ForEach(ReaderLayoutKind.allCases) { Text($0.displayName).tag($0) }
-                }
-                .labelsHidden()
-            }
-            LabeledContent("Direction") {
-                Picker("Direction", selection: binding(get: { $0.direction }, set: { $0.direction = $1 })) {
-                    ForEach(ReadingDirection.allCases) { Text($0.displayName).tag($0) }
-                }
-                .labelsHidden()
-            }
-            LabeledContent("Pages") {
-                Picker("Pages", selection: binding(get: { $0.pageMode }, set: { $0.pageMode = $1 })) {
-                    ForEach(PageMode.allCases) { Text($0.displayName).tag($0) }
-                }
-                .labelsHidden()
-            }
-            LabeledContent("Fit") {
-                Picker("Fit", selection: binding(get: { $0.fitMode }, set: { $0.fitMode = $1 })) {
-                    ForEach(PageFitMode.allCases) { Text($0.displayName).tag($0) }
-                }
-                .labelsHidden()
-            }
-
-            Divider()
-
-            HStack(spacing: 8) {
-                Button("Zoom In") { model.zoomIn() }
-                Button("Zoom Out") { model.zoomOut() }
-                Button("Actual Fit") { model.resetZoom() }
-            }
-            .controlSize(.small)
-
-            Divider()
-
-            HStack(spacing: 8) {
-                Button("Mark Chapter Read") { model.markCurrentChapterRead() }
-                Button("Mark Unread") { model.markCurrentChapterUnread() }
-            }
-            .controlSize(.small)
-        }
-        .padding(14)
-        .frame(width: 300)
-    }
-
-    /// A preset as a pill, filled in when the reader is already set up that way.
-    private func presetButton(_ preset: ReaderPreset) -> some View {
-        let isCurrent = settings.layout == preset.layout && settings.pageMode == preset.pageMode
-        return Button {
-            settings.layout = preset.layout
-            settings.pageMode = preset.pageMode
-        } label: {
-            Text(preset.displayName)
-                .font(.subheadline.weight(.medium))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-                .background(isCurrent ? AnyShapeStyle(.tint) : AnyShapeStyle(.quaternary), in: Capsule())
-                .foregroundStyle(isCurrent ? Color.white : Color.primary)
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func binding<Value>(
-        get: @escaping (SettingsStore) -> Value,
-        set: @escaping (SettingsStore, Value) -> Void
-    ) -> Binding<Value> {
-        Binding(get: { get(settings) }, set: { set(settings, $0) })
     }
 
     private func toggleFullScreen() {
@@ -2412,7 +2338,7 @@ struct ReaderView: View {
     /// two side by side. Without the single-page lock the window keeps its old shape
     /// and the page sits between bars.
     private var windowAspectRatio: CGFloat? {
-        guard settings.layout == .horizontal else { return nil }
+        guard viewOptions.layout == .horizontal else { return nil }
         let page = episodePageAspect ?? Self.typicalPageAspectRatio
         return page * typicalSpreadPageCount
     }
@@ -2421,7 +2347,7 @@ struct ReaderView: View {
     /// first or last page must not flip the window back to a single-page shape, so the
     /// window follows the episode's usual spread rather than the current one.
     private var typicalSpreadPageCount: CGFloat {
-        guard settings.pageMode == .double else { return 1 }
+        guard viewOptions.pageMode == .double else { return 1 }
         // Before the page list arrives, Classic is more likely to become a normal
         // two-page spread than a single-page chapter. Starting there avoids an extra
         // resize when the first spread loads; the sampler corrects one-page chapters.
@@ -2446,7 +2372,7 @@ struct ReaderView: View {
     /// view there. While the live resize is in progress, the pin task repeats this
     /// so page-height changes and the scroll offset stay together.
     private func applyResizeAnchor() {
-        guard settings.layout == .vertical,
+        guard viewOptions.layout == .vertical,
               let anchor = resizeAnchor,
               let scrollView = verticalScrollView
         else { return }
@@ -2507,7 +2433,7 @@ struct ReaderView: View {
             episodeAspectLocked = false
         }
 
-        guard settings.layout == .horizontal,
+        guard viewOptions.layout == .horizontal,
               !episodeAspectLocked,
               !model.pages.isEmpty
         else { return }
@@ -2531,7 +2457,7 @@ struct ReaderView: View {
             guard !Task.isCancelled,
                   episodeAspectChapterId == chapterId,
                   !episodeAspectLocked,
-                  settings.layout == .horizontal
+                  viewOptions.layout == .horizontal
             else { return }
 
             let pages = model.pages
@@ -2558,7 +2484,7 @@ struct ReaderView: View {
         guard !Task.isCancelled,
               episodeAspectChapterId == chapterId,
               !episodeAspectLocked,
-              settings.layout == .horizontal,
+              viewOptions.layout == .horizontal,
               !model.pages.isEmpty
         else { return }
 
@@ -3157,59 +3083,6 @@ private struct WindowAccessor: NSViewRepresentable {
         Task { @MainActor in
             if window !== nsView.window { window = nsView.window }
         }
-    }
-}
-
-/// A single page that supports pinch/double-click zoom and panning while zoomed.
-struct ZoomablePage: View {
-    let page: Page
-    @Binding var zoom: CGFloat
-    let maxPixelSize: Int
-
-    @State private var committedOffset: CGSize = .zero
-    @State private var dragOffset: CGSize = .zero
-    @State private var zoomBase: CGFloat = 1
-
-    var body: some View {
-        GeometryReader { geometry in
-            AsyncPageImage(page: page, maxPixelSize: maxPixelSize, contentMode: .fit)
-                .frame(width: geometry.size.width, height: geometry.size.height)
-                .scaleEffect(zoom)
-                .offset(
-                    x: committedOffset.width + dragOffset.width,
-                    y: committedOffset.height + dragOffset.height
-                )
-                .contentShape(Rectangle())
-                .gesture(magnifyGesture)
-                .gesture(panGesture, including: zoom > 1 ? .all : .subviews)
-                .onChange(of: zoom) { _, newValue in
-                    if newValue <= 1 {
-                        committedOffset = .zero
-                        dragOffset = .zero
-                    }
-                }
-                .clipped()
-        }
-    }
-
-    private var magnifyGesture: some Gesture {
-        MagnifyGesture()
-            .onChanged { value in
-                zoom = min(max(1, zoomBase * value.magnification), 5)
-            }
-            .onEnded { _ in
-                zoomBase = zoom
-            }
-    }
-
-    private var panGesture: some Gesture {
-        DragGesture()
-            .onChanged { value in dragOffset = value.translation }
-            .onEnded { value in
-                committedOffset.width += value.translation.width
-                committedOffset.height += value.translation.height
-                dragOffset = .zero
-            }
     }
 }
 

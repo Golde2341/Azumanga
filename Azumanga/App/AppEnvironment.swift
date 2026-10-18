@@ -7,6 +7,7 @@ import SwiftUI
 @Observable
 final class AppEnvironment {
     let settings: SettingsStore
+    let mangaViewOptions: MangaViewOptionsStore
     let services: Services
     let library: LibraryModel
     let discovery: DiscoveryModel
@@ -21,6 +22,7 @@ final class AppEnvironment {
         let healthChecker = SourceHealthChecker(services: services)
 
         self.settings = settings
+        self.mangaViewOptions = MangaViewOptionsStore()
         self.services = services
         self.library = LibraryModel(services: services)
         self.discovery = DiscoveryModel(services: services)

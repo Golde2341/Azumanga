@@ -95,7 +95,11 @@ private struct ReadingSettingsView: View {
         @Bindable var settings = settings
 
         Form {
-            Section("Layout") {
+            Section("Default Reading View") {
+                Text("These settings are used for manga without a custom view. Change individual manga in the reader’s Per Manga View Options.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Picker("Reading mode", selection: $settings.layout) {
                     ForEach(ReaderLayoutKind.allCases) { kind in
                         Text(kind.displayName).tag(kind)
@@ -155,26 +159,12 @@ private struct AppearanceSettingsView: View {
         @Bindable var settings = settings
 
         Form {
-            Section("Reader background") {
-                Picker("Background", selection: $settings.background) {
-                    ForEach(PageBackground.allCases) { background in
-                        Text(background.displayName).tag(background)
-                    }
-                }
-                .pickerStyle(.inline)
+            Section("Default Reader Background") {
+                BackgroundSwatches(selection: $settings.background)
 
-                HStack(spacing: 10) {
-                    ForEach(PageBackground.allCases) { background in
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(background.color)
-                            .frame(height: 36)
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 6)
-                                    .strokeBorder(settings.background == background ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: settings.background == background ? 2 : 1)
-                            }
-                            .onTapGesture { settings.background = background }
-                    }
-                }
+                Text("Used for manga without a custom view. Each manga can choose its own background in the reader’s Per Manga View Options.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -222,12 +212,3 @@ private struct StorageSettingsView: View {
     }
 }
 
-extension PageBackground {
-    var color: Color {
-        switch self {
-        case .black: .black
-        case .darkGray: Color(white: 0.12)
-        case .white: .white
-        }
-    }
-}
