@@ -54,6 +54,8 @@ struct ReaderView: View {
     @State private var showChapterPicker = false
     /// The window hosting the reader, used to drive full screen and measure traffic lights.
     @State private var window: NSWindow?
+    /// Keeps native window-edge resizing on the current page/spread aspect.
+    @State private var windowResizeDelegate = ReaderWindowResizeDelegate()
     /// Whether the reader is filling the screen in its own windowed mode. The reader
     /// keeps this alongside AppKit's native full screen; the two never overlap.
     @State private var isReaderFullScreen = false
@@ -115,6 +117,8 @@ struct ReaderView: View {
     @State private var isScrubbing = false
     /// The scroll view backing the vertical reader, used for native magnification.
     @State private var verticalScrollView: NSScrollView?
+    /// Keeps the webtoon's position stable while the window's width changes.
+    @State private var verticalResizeState = ReaderVerticalResizeState()
     /// Whether a pinch is in flight. While the pages change size under the scroll
     /// view, its intermediate positions must not be treated as page turns.
     @State private var isMagnifying = false
@@ -132,6 +136,12 @@ struct ReaderView: View {
     /// reserves a slot of this shape before its image arrives, so an image finishing
     /// its load can never reflow the stack and move the viewport.
     @State private var verticalPageAspect: CGFloat?
+    /// The stable page proportion for this episode, decided once from a sample and
+    /// then kept for every spread in it.
+    @State private var episodePageAspect: CGFloat?
+    @State private var episodeAspectChapterId: String?
+    @State private var episodeAspectLocked = false
+    @State private var episodeShapeTask: Task<Void, Never>?
     /// The shape last put on to the window, so it is only resized when it actually changes.
     @State private var appliedAspectRatio: CGFloat = 0
     /// Distance from the window's top edge down to the traffic lights' centre line, so the
@@ -183,33 +193,6 @@ struct ReaderView: View {
                     .transition(.opacity)
             }
 
-            if controlsVisible, let window, !isReaderFullScreen, !isNativeFullScreen {
-                // The OS's edge hit areas are easy to miss, and live resizing the
-                // chrome-heavy reader window does nothing on this macOS. An explicit
-                // grip resizes the window directly and disappears with the controls.
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        ReaderResizeGrip(
-                            window: window,
-                            aspectRatio: windowAspectRatio,
-                            onBegan: {
-                                revealControls()
-                                isResizingWindow = true
-                            },
-                            onEnded: {
-                                isResizingWindow = false
-                                revealControls()
-                            }
-                        )
-                        .frame(width: 22, height: 22)
-                        .padding(.trailing, 10)
-                        .padding(.bottom, 10)
-                    }
-                }
-                .transition(.opacity)
-            }
         }
         .animation(.easeInOut(duration: 0.18), value: controlsVisible)
         .animation(.easeInOut(duration: 0.3), value: showIntroCover)
@@ -250,9 +233,14 @@ struct ReaderView: View {
             revealControls()
             scheduleIntroIfNeeded()
             syncSectionsFromModel()
+            beginEpisodeShapeSampling(force: true)
         }
         .onChange(of: model.pages) { _, _ in
             syncSectionsFromModel()
+            beginEpisodeShapeSampling()
+        }
+        .onChange(of: model.chapter.chapterId) { _, _ in
+            beginEpisodeShapeSampling(force: true)
         }
         .onChange(of: model.chapterCount) { _, _ in
             // A reader opened without a chapter list gets it in the background.
@@ -267,6 +255,14 @@ struct ReaderView: View {
             // AppKit's own full screen out of the reader's way.
             guard let newWindow else { return }
             makeBorderless(newWindow)
+            windowResizeDelegate.attach(to: newWindow)
+            updateWindowResizeLock()
+            // The image task can finish before the window accessor has published the
+            // window. Shape it as soon as both sides exist; pageAspect changes refine
+            // the ratio when the current page's real proportions arrive.
+            Task { @MainActor in
+                reconcileWindow(newWindow, resizingWindowShape: true)
+            }
         }
         .navigationTitle(model.chapterLabel)
         .focusable()
@@ -302,25 +298,38 @@ struct ReaderView: View {
             ChapterPickerSheet(model: model, isPresented: $showChapterPicker)
         }
         .task(id: "\(model.chapter.chapterId):\(model.currentIndex)") {
-            // A page's proportions are only knowable once its image has been loaded, so this
-            // looks again a few times before settling for the stand-in. Keyed by chapter id
-            // as well: crossing chapters can leave the page index unchanged.
+            // Keep the vertical stack's fixed slot shape informed. The horizontal
+            // window's shape is decided per episode by the sampler, not per page.
             for attempt in 0..<4 {
                 await readPageAspect()
-                if let window {
-                    // Resize once the page's real shape is known, so a horizontal
-                    // window takes the page's proportions instead of framing it.
-                    reconcileWindow(window, resizingWindowShape: pageAspect != nil)
-                }
                 if pageAspect != nil || attempt == 3 { return }
                 try? await Task.sleep(for: .seconds(1))
             }
+        }
+        .onChange(of: episodePageAspect) { _, newAspect in
+            updateWindowResizeLock()
+            // One correction per episode, once the sample resolves.
+            guard newAspect != nil, let window, !isResizingWindow else { return }
+            reconcileWindow(window, resizingWindowShape: true)
+        }
+        .onChange(of: windowAspectRatio) { _, _ in
+            updateWindowResizeLock()
+        }
+        .onChange(of: isReaderFullScreen) { _, _ in
+            updateWindowResizeLock()
+        }
+        .onChange(of: isNativeFullScreen) { _, _ in
+            updateWindowResizeLock()
+        }
+        .onChange(of: isNativeFullScreenTransition) { _, _ in
+            updateWindowResizeLock()
         }
         .onChange(of: settings.layout) { _, newLayout in
             if newLayout == .vertical {
                 // Releasing the lock must not wait on full-screen bookkeeping; this
                 // only clears the ratio and any stuck size limit, it never resizes.
                 applyWindowShape()
+                updateWindowResizeLock()
                 syncSectionsFromModel()
                 // The vertical scroll view is new; open it where the reader is.
                 if let id = currentVerticalPageID {
@@ -330,10 +339,19 @@ struct ReaderView: View {
                     pendingScrollPageID = id
                 }
             }
+            if newLayout == .horizontal {
+                beginEpisodeShapeSampling()
+            }
             guard let window else { return }
             reconcileWindow(window, resizingWindowShape: true)
         }
         .onChange(of: settings.pageMode) { _, _ in
+            updateWindowResizeLock()
+            guard let window else { return }
+            reconcileWindow(window, resizingWindowShape: true)
+        }
+        .onChange(of: settings.doublePageFirstPageAlone) { _, _ in
+            updateWindowResizeLock()
             guard let window else { return }
             reconcileWindow(window, resizingWindowShape: true)
         }
@@ -394,6 +412,32 @@ struct ReaderView: View {
                 }
             }
         }
+        // Window resizing changes every vertical page's height. Without anchoring the
+        // scroll position, the pages slide under the pointer while the user is only
+        // changing the window's width.
+        .task(id: window) {
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.didResizeNotification,
+                object: window
+            ) {
+                guard settings.layout == .vertical,
+                      !isReaderFullScreen,
+                      !isNativeFullScreen,
+                      !isNativeFullScreenTransition
+                else {
+                    verticalResizeState.lastWidth = nil
+                    continue
+                }
+
+                verticalResizeState.applyTask?.cancel()
+                verticalResizeState.applyTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(20))
+                    guard !Task.isCancelled else { return }
+                    preserveVerticalScrollDuringResize()
+                }
+            }
+        }
         // A level above the menu bar is app-wide z-order, not just this space. Drop it
         // when the app is no longer frontmost so the reader does not float above other
         // applications; put it back when the reader becomes active again.
@@ -429,6 +473,8 @@ struct ReaderView: View {
                     }
                 }
             }
+            windowResizeDelegate.detach()
+            episodeShapeTask?.cancel()
             verticalScrollTracker.applyTask?.cancel()
             model.flushProgress()
         }
@@ -439,6 +485,8 @@ struct ReaderView: View {
     private func beginNativeFullScreenTransition() {
         nativeFullScreenGeneration += 1
         isNativeFullScreenTransition = true
+        windowResizeDelegate.isEnabled = false
+        windowResizeDelegate.aspectRatio = nil
     }
 
     /// Fills the screen with the reader without involving AppKit's full screen.
@@ -466,6 +514,8 @@ struct ReaderView: View {
         // The page fills the screen; the grip that shapes the windowed reader is
         // not available there.
         appliedAspectRatio = 0
+        windowResizeDelegate.isEnabled = false
+        windowResizeDelegate.aspectRatio = nil
 
         // Native full screen is not available while the reader is filling the screen
         // itself; the green button zooms instead. It comes back on exit.
@@ -539,6 +589,7 @@ struct ReaderView: View {
                 self.windowedLevel = nil
             }
             self.windowedFrame = nil
+            updateWindowResizeLock()
             reconcileWindow(window)
         }
     }
@@ -834,6 +885,10 @@ struct ReaderView: View {
                         pendingScrollPageID = id
                     }
                     performPendingScroll(proxy)
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(60))
+                        updateVerticalResizeBaseline()
+                    }
                 }
                 .scrollIndicators(.never)
                 .gesture(verticalZoomGesture)
@@ -2120,8 +2175,69 @@ struct ReaderView: View {
     /// and the page sits between bars.
     private var windowAspectRatio: CGFloat? {
         guard settings.layout == .horizontal else { return nil }
-        let page = pageAspect ?? Self.typicalPageAspectRatio
-        return settings.pageMode == .double ? page * 2 : page
+        let page = episodePageAspect ?? Self.typicalPageAspectRatio
+        return page * typicalSpreadPageCount
+    }
+
+    /// The page count of a normal spread in this episode. In double-page mode a lone
+    /// first or last page must not flip the window back to a single-page shape, so the
+    /// window follows the episode's usual spread rather than the current one.
+    private var typicalSpreadPageCount: CGFloat {
+        guard settings.pageMode == .double else { return 1 }
+        // Before the page list arrives, Classic is more likely to become a normal
+        // two-page spread than a single-page chapter. Starting there avoids an extra
+        // resize when the first spread loads; the sampler corrects one-page chapters.
+        guard !spreads.isEmpty else { return 2 }
+        return spreads.contains { $0.count > 1 } ? 2 : 1
+    }
+
+    /// Keeps the window delegate's native edge-resize lock in step with the mode and
+    /// the spread currently on screen. Vertical mode and both full-screen modes leave
+    /// the border free.
+    private func updateWindowResizeLock() {
+        let ratio = windowAspectRatio
+        let enabled = ratio != nil
+            && !isReaderFullScreen
+            && !isNativeFullScreen
+            && !isNativeFullScreenTransition
+        windowResizeDelegate.aspectRatio = enabled ? ratio : nil
+        windowResizeDelegate.isEnabled = enabled
+    }
+
+    private func updateVerticalResizeBaseline() {
+        guard let scrollView = verticalScrollView else { return }
+        let width = scrollView.contentView.bounds.width
+        if width > 0 {
+            verticalResizeState.lastWidth = width
+        }
+    }
+
+    /// Page heights are proportional to the viewport width, so a window-resize event
+    /// must move the clip view by the same ratio to keep the page under the viewport
+    /// top in place. Without this, the unchanged content offset looks like the pages
+    /// are scrolling by themselves.
+    private func preserveVerticalScrollDuringResize() {
+        guard settings.layout == .vertical,
+              let scrollView = verticalScrollView
+        else { return }
+
+        let clip = scrollView.contentView
+        let width = clip.bounds.width
+        guard width > 0 else { return }
+
+        guard let lastWidth = verticalResizeState.lastWidth, lastWidth > 0 else {
+            verticalResizeState.lastWidth = width
+            return
+        }
+        guard abs(width - lastWidth) > 0.1 else { return }
+
+        let ratio = width / lastWidth
+        let origin = clip.bounds.origin
+        clip.setBoundsOrigin(
+            NSPoint(x: origin.x, y: origin.y * ratio)
+        )
+        scrollView.reflectScrolledClipView(clip)
+        verticalResizeState.lastWidth = width
     }
 
     /// A page's width over its height, read from a page of the current spread that has
@@ -2149,6 +2265,119 @@ struct ReaderView: View {
             return
         }
         pageAspect = nil
+    }
+
+    /// Starts (or restarts) the one-time sample that decides the episode's page shape.
+    /// The result is kept for the whole chapter; turning pages never reshapes the
+    /// window again.
+    private func beginEpisodeShapeSampling(force: Bool = false) {
+        let chapterId = model.chapter.chapterId
+
+        if force || episodeAspectChapterId != chapterId {
+            episodeShapeTask?.cancel()
+            episodeShapeTask = nil
+            episodeAspectChapterId = chapterId
+            episodePageAspect = nil
+            episodeAspectLocked = false
+        }
+
+        guard settings.layout == .horizontal,
+              !episodeAspectLocked,
+              !model.pages.isEmpty
+        else { return }
+
+        episodeShapeTask?.cancel()
+        episodeShapeTask = Task { @MainActor in
+            await sampleEpisodePageAspect(chapterId: chapterId)
+        }
+    }
+
+    /// Waits briefly for a few pages to be decoded, then takes the median of their
+    /// shapes. Waiting for cached images means this analysis costs no extra downloads.
+    private func sampleEpisodePageAspect(chapterId: String) async {
+        var samples: [Int: CGFloat] = [:]
+
+        for _ in 0..<20 {
+            // Let a chapter transition finish clearing the old page array before
+            // measuring anything.
+            try? await Task.sleep(for: .milliseconds(150))
+
+            guard !Task.isCancelled,
+                  episodeAspectChapterId == chapterId,
+                  !episodeAspectLocked,
+                  settings.layout == .horizontal
+            else { return }
+
+            let pages = model.pages
+            guard !pages.isEmpty else { continue }
+
+            let indices = episodeSampleIndices(
+                count: pages.count,
+                current: model.currentIndex,
+                limit: 5
+            )
+            for index in indices where samples[index] == nil {
+                guard let image = await images.cachedImage(
+                    for: pages[index].url,
+                    maxPixelSize: model.renderMaxPixelSize
+                ), image.height > 0 else { continue }
+                samples[index] = CGFloat(image.width) / CGFloat(image.height)
+            }
+
+            if samples.count >= min(3, pages.count) {
+                break
+            }
+        }
+
+        guard !Task.isCancelled,
+              episodeAspectChapterId == chapterId,
+              !episodeAspectLocked,
+              settings.layout == .horizontal,
+              !model.pages.isEmpty
+        else { return }
+
+        let pages = model.pages
+        let required = min(3, pages.count)
+        episodePageAspect = samples.count >= required
+            ? Self.median(Array(samples.values))
+            : nil
+        episodeAspectLocked = true
+        episodeShapeTask = nil
+
+        if let window, !isResizingWindow {
+            reconcileWindow(window, resizingWindowShape: true)
+        }
+        updateWindowResizeLock()
+    }
+
+    /// Up to `limit` distinct pages around the current one. Keeping the sample near
+    /// the reader avoids pulling unrelated pages into memory just to measure them.
+    private func episodeSampleIndices(count: Int, current: Int, limit: Int) -> [Int] {
+        guard count > 0 else { return [] }
+        var indices: [Int] = []
+        func add(_ index: Int) {
+            guard index >= 0, index < count, !indices.contains(index) else { return }
+            indices.append(index)
+        }
+
+        add(current)
+        var distance = 1
+        while indices.count < limit, distance < count {
+            add(current + distance)
+            add(current - distance)
+            distance += 1
+        }
+        return Array(indices.prefix(limit))
+    }
+
+    private static func median(_ values: [CGFloat]) -> CGFloat? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        return sorted[middle]
     }
 
     /// Stand-in proportions, used until a page has loaded.
@@ -2183,9 +2412,20 @@ struct ReaderView: View {
         guard resizing, ratio != appliedAspectRatio else { return }
         appliedAspectRatio = ratio
 
-        let width = window.contentRect(forFrameRect: window.frame).width
-        guard width > 0 else { return }
-        window.setContentSize(NSSize(width: width, height: (width / ratio).rounded()))
+        // The window content runs under the transparent titlebar and fills the frame,
+        // which is also the rectangle the border-resize lock and the grip use.
+        let frame = window.frame
+        guard frame.width > 0 else { return }
+        let height = (frame.width / ratio).rounded()
+        window.setFrame(
+            NSRect(
+                x: frame.minX,
+                y: frame.maxY - height,
+                width: frame.width,
+                height: height
+            ),
+            display: true
+        )
     }
 
     /// A reader that is not filling the screen must always be resizable. If a
@@ -2257,6 +2497,175 @@ private enum ReaderFullScreenWindow {
 
     static func exit(_ window: NSWindow) {
         activeWindows.remove(window)
+    }
+}
+
+/// Enforces the current page/spread shape while the user drags any native window
+/// border or corner. It sits in front of SwiftUI's own window delegate and forwards
+/// every other delegate message there, so full screen, closing and chrome continue to
+/// behave normally.
+private final class ReaderWindowResizeDelegate: NSObject, NSWindowDelegate {
+    private enum ResizeAxis {
+        case horizontal
+        case vertical
+        case corner
+    }
+
+    private weak var window: NSWindow?
+    private var originalDelegate: (any NSWindowDelegate)?
+    private var liveResizeAxis: ResizeAxis = .corner
+    var aspectRatio: CGFloat?
+    var isEnabled = false
+
+    func attach(to window: NSWindow) {
+        if self.window === window, window.delegate === self { return }
+        detach()
+        self.window = window
+        if window.delegate !== self {
+            originalDelegate = window.delegate
+            window.delegate = self
+        }
+    }
+
+    func detach() {
+        if let window, window.delegate === self {
+            window.delegate = originalDelegate
+        }
+        window = nil
+        originalDelegate = nil
+    }
+
+    func windowWillStartLiveResize(_ notification: Notification) {
+        if let originalDelegate,
+           originalDelegate.responds(to: #selector(NSWindowDelegate.windowWillStartLiveResize(_:))) {
+            originalDelegate.windowWillStartLiveResize?(notification)
+        }
+
+        guard let window else {
+            liveResizeAxis = .corner
+            return
+        }
+
+        // Decide once, from the edge the pointer grabbed. Re-deciding on every
+        // resize event is what made a diagonal drag flip between the horizontal and
+        // vertical result.
+        let mouse = NSEvent.mouseLocation
+        let frame = window.frame
+        let edge: CGFloat = 12
+        let nearVerticalEdge = abs(mouse.x - frame.minX) <= edge
+            || abs(mouse.x - frame.maxX) <= edge
+        let nearHorizontalEdge = abs(mouse.y - frame.minY) <= edge
+            || abs(mouse.y - frame.maxY) <= edge
+
+        if nearVerticalEdge && nearHorizontalEdge {
+            liveResizeAxis = .corner
+        } else if nearVerticalEdge {
+            liveResizeAxis = .horizontal
+        } else if nearHorizontalEdge {
+            liveResizeAxis = .vertical
+        } else {
+            liveResizeAxis = .corner
+        }
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        liveResizeAxis = .corner
+        if let originalDelegate,
+           originalDelegate.responds(to: #selector(NSWindowDelegate.windowDidEndLiveResize(_:))) {
+            originalDelegate.windowDidEndLiveResize?(notification)
+        }
+    }
+
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        guard isEnabled,
+              let aspectRatio,
+              aspectRatio.isFinite,
+              aspectRatio > 0,
+              sender === window,
+              !sender.styleMask.contains(.fullScreen)
+        else { return frameSize }
+
+        // Let SwiftUI's delegate have the first say if it implements this method.
+        var proposed = frameSize
+        if let originalDelegate,
+           originalDelegate.responds(to: #selector(NSWindowDelegate.windowWillResize(_:to:))),
+           let original = originalDelegate.windowWillResize?(sender, to: proposed) {
+            proposed = original
+        }
+        guard proposed.width > 0, proposed.height > 0 else { return proposed }
+
+        let targetWidth: CGFloat
+        let targetHeight: CGFloat
+        switch liveResizeAxis {
+        case .horizontal:
+            targetWidth = proposed.width
+            targetHeight = proposed.width / aspectRatio
+        case .vertical:
+            targetHeight = proposed.height
+            targetWidth = proposed.height * aspectRatio
+        case .corner:
+            // Project the proposed corner onto the aspect-ratio line: average the
+            // width implied by the horizontal movement and the width implied by the
+            // vertical movement. The result follows the pointer's diagonal smoothly
+            // instead of switching between the two axes.
+            let widthFromHorizontal = proposed.width
+            let widthFromVertical = proposed.height * aspectRatio
+            targetWidth = (widthFromHorizontal + widthFromVertical) / 2
+            targetHeight = targetWidth / aspectRatio
+        }
+
+        // Keep the reader usable at very small sizes without letting the minimum
+        // clamp break the ratio.
+        let scale = max(
+            1,
+            420 / targetWidth,
+            260 / targetHeight
+        )
+        return NSSize(
+            width: targetWidth * scale,
+            height: targetHeight * scale
+        )
+    }
+
+    /// Double-clicking the title bar (or pressing zoom) must not turn a page-shaped
+    /// reader into the screen's shape. Give AppKit a zoom frame that already has the
+    /// episode's aspect ratio.
+    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
+        guard isEnabled,
+              let aspectRatio,
+              aspectRatio.isFinite,
+              aspectRatio > 0
+        else {
+            if let originalDelegate,
+               originalDelegate.responds(to: #selector(NSWindowDelegate.windowWillUseStandardFrame(_:defaultFrame:))) {
+                return originalDelegate.windowWillUseStandardFrame?(window, defaultFrame: newFrame) ?? newFrame
+            }
+            return newFrame
+        }
+
+        var width = newFrame.width
+        var height = width / aspectRatio
+        if height > newFrame.height {
+            height = newFrame.height
+            width = height * aspectRatio
+        }
+
+        return NSRect(
+            x: newFrame.midX - width / 2,
+            y: newFrame.midY - height / 2,
+            width: width,
+            height: height
+        )
+    }
+
+    override func responds(to aSelector: Selector!) -> Bool {
+        if super.responds(to: aSelector) { return true }
+        return originalDelegate?.responds(to: aSelector) ?? false
+    }
+
+    override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        if originalDelegate?.responds(to: aSelector) == true { return originalDelegate }
+        return super.forwardingTarget(for: aSelector)
     }
 }
 
@@ -2392,6 +2801,12 @@ private struct ReaderResizeGrip: NSViewRepresentable {
             onEnded?()
         }
     }
+}
+
+/// Tracks the last viewport width used by the webtoon resize anchor.
+private final class ReaderVerticalResizeState {
+    var lastWidth: CGFloat?
+    var applyTask: Task<Void, Never>?
 }
 
 /// Vertical reader page tracking that does not invalidate the view when it changes.
