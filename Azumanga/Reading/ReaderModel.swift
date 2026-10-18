@@ -295,13 +295,24 @@ final class ReaderModel {
 
     // MARK: - Navigation
 
-    func goToPage(_ index: Int, save: Bool = true, resetZoom: Bool = true) {
+    func goToPage(
+        _ index: Int,
+        save: Bool = true,
+        resetZoom: Bool = true,
+        prefetch: Bool = true
+    ) {
         guard !pages.isEmpty else { return }
         let clamped = min(max(0, index), pages.count - 1)
         guard clamped != currentIndex else { return }
         currentIndex = clamped
         if resetZoom { zoom = 1 }
         if save { scheduleSave() }
+        if prefetch { prefetchAhead() }
+    }
+
+    /// Loads the pages around the current one after a scrub has finished. Scrubbing
+    /// itself deliberately skips prefetching while it flies through pages.
+    func prefetchAroundCurrentPage() {
         prefetchAhead()
     }
 

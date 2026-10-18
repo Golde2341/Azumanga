@@ -1059,6 +1059,7 @@ struct ReaderView: View {
     private func trackVerticalPage(_ tops: [ReaderPageID: CGFloat]) {
         guard !isMagnifying,
               !isZoomSettling,
+              !isScrubbing,
               !verticalScrollTracker.isRestoring,
               !tops.isEmpty
         else { return }
@@ -1093,6 +1094,7 @@ struct ReaderView: View {
               !verticalScrollTracker.isRestoring,
               !isMagnifying,
               !isZoomSettling,
+              !isScrubbing,
               let id = verticalScrollTracker.topPageID,
               let section = sections.first(where: { $0.chapterId == id.chapterId }),
               let pagePosition = section.pages.firstIndex(where: { $0.index == id.pageIndex }),
@@ -1373,7 +1375,7 @@ struct ReaderView: View {
                 handleHorizontalPosition(newValue)
             }
             .onChange(of: currentHorizontalItemID) { _, _ in
-                syncHorizontalPosition(animated: spreadPosition != nil)
+                syncHorizontalPosition(animated: !isScrubbing && spreadPosition != nil)
             }
             .onChange(of: viewOptions.pageMode) { _, _ in
                 syncHorizontalPosition(animated: true)
@@ -1470,7 +1472,8 @@ struct ReaderView: View {
     private func handleHorizontalPosition(_ id: ReaderStreamItemID?) {
         guard !isNativeFullScreenTransition,
               !isFullScreenAnimating,
-              !isPageSyncSuppressed
+              !isPageSyncSuppressed,
+              !isScrubbing
         else { return }
         guard let id else { return }
 
@@ -1908,50 +1911,6 @@ struct ReaderView: View {
                         progressBar
                     }
                     .frame(width: 260)
-                    .overlay {
-                        // A real slider does the tracking, over the whole block: a
-                        // click lands where it is aimed (including on the page count)
-                        // and a drag keeps going even when the pointer leaves the thin
-                        // bar. It is invisible; the artwork underneath is the bar.
-                        GeometryReader { geometry in
-                            Slider(value: $scrubFraction, in: 0...1) { editing in
-                                if editing {
-                                    // Keep the controls (and this bar) on screen for the
-                                    // whole drag.
-                                    revealControls()
-                                    isScrubbing = true
-                                } else {
-                                    let target = ReaderScrubbing.page(
-                                        atFraction: scrubFraction,
-                                        pageCount: model.pages.count
-                                    )
-                                    isScrubbing = false
-                                    model.goToPage(target)
-                                }
-                            }
-                            .labelsHidden()
-                            .focusable(false)
-                            .opacity(0.001)
-                            // Clicking the track jumps there even on control styles
-                            // that do not move the knob to the click themselves.
-                            .simultaneousGesture(
-                                SpatialTapGesture()
-                                    .onEnded { value in
-                                        let width = geometry.size.width
-                                        guard width > 0 else { return }
-                                        let fraction = min(max(0, value.location.x / width), 1)
-                                        scrubFraction = fraction
-                                        isScrubbing = false
-                                        model.goToPage(
-                                            ReaderScrubbing.page(
-                                                atFraction: fraction,
-                                                pageCount: model.pages.count
-                                            )
-                                        )
-                                    }
-                            )
-                        }
-                    }
 
                     Button {
                         goToAdjacentChapter(1)
@@ -1989,30 +1948,138 @@ struct ReaderView: View {
         return ReaderScrubbing.page(atFraction: scrubFraction, pageCount: model.pages.count)
     }
 
-    /// Progress through the chapter, draggable to jump. The page itself is only changed
-    /// when the drag ends — scrubbing across a long chapter would otherwise ask for every
-    /// page it passes over.
+    /// Progress through the chapter as discrete page steps. The whole bar is the
+    /// gesture surface: a click jumps to the nearest step, and a drag moves the reader
+    /// through pages as it crosses them.
     private var progressBar: some View {
         GeometryReader { geometry in
             let width = geometry.size.width
-            let fraction = ReaderScrubbing.fraction(ofPage: scrubPage, pageCount: model.pages.count)
+            let pageCount = model.pages.count
+            let current = scrubPage
+            let fraction = ReaderScrubbing.fraction(ofPage: current, pageCount: pageCount)
 
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(.quaternary)
-                    .frame(height: 4)
-                Capsule()
-                    .fill(.tint)
-                    .frame(width: width * fraction, height: 4)
-                Circle()
-                    .fill(.tint)
-                    .frame(width: 10, height: 10)
-                    .offset(x: min(max(0, width * fraction - 5), max(0, width - 10)))
+            Canvas { context, size in
+                let trackHeight: CGFloat = 4
+                let centerY = size.height / 2
+                let trackRect = CGRect(
+                    x: 0,
+                    y: centerY - trackHeight / 2,
+                    width: size.width,
+                    height: trackHeight
+                )
+                context.fill(
+                    Path(roundedRect: trackRect, cornerRadius: trackHeight / 2),
+                    with: .color(Color.secondary.opacity(0.22))
+                )
+
+                if fraction > 0 {
+                    let fillRect = CGRect(
+                        x: 0,
+                        y: trackRect.minY,
+                        width: size.width * fraction,
+                        height: trackHeight
+                    )
+                    context.fill(
+                        Path(roundedRect: fillRect, cornerRadius: trackHeight / 2),
+                        with: .color(.accentColor)
+                    )
+                }
+
+                if pageCount > 1 {
+                    // A tick per page on short chapters, and a readable sample on very
+                    // long ones. The filled knob still quantizes to exact page steps.
+                    let maximumTicks = 100
+                    let tickStride = max(
+                        1,
+                        Int(ceil(Double(pageCount) / Double(maximumTicks)))
+                    )
+                    for index in stride(from: 0, to: pageCount, by: tickStride) {
+                        let x = size.width * CGFloat(index) / CGFloat(pageCount - 1)
+                        let isFilled = index <= current
+                        let tickHeight: CGFloat = index == current ? 10 : 7
+                        let tickRect = CGRect(
+                            x: x - 0.5,
+                            y: centerY - tickHeight / 2,
+                            width: 1,
+                            height: tickHeight
+                        )
+                        context.fill(
+                            Path(tickRect),
+                            with: .color(
+                                isFilled
+                                    ? Color.white.opacity(0.5)
+                                    : Color.secondary.opacity(0.38)
+                            )
+                        )
+                    }
+                }
+
+                let knobDiameter: CGFloat = 10
+                let knobX = min(
+                    max(knobDiameter / 2, size.width * fraction),
+                    max(knobDiameter / 2, size.width - knobDiameter / 2)
+                )
+                context.fill(
+                    Path(ellipseIn: CGRect(
+                        x: knobX - knobDiameter / 2,
+                        y: centerY - knobDiameter / 2,
+                        width: knobDiameter,
+                        height: knobDiameter
+                    )),
+                    with: .color(.accentColor)
+                )
             }
-            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(scrubGesture(width: width))
         }
-        .frame(height: 20)
-        .help("Drag to jump to a page")
+        .frame(height: 22)
+        .help("Click or drag to jump through pages")
+    }
+
+    private func scrubGesture(width: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                updateScrub(atX: value.location.x, width: width, isFinal: false)
+            }
+            .onEnded { value in
+                updateScrub(atX: value.location.x, width: width, isFinal: true)
+            }
+    }
+
+    private func updateScrub(atX x: CGFloat, width: CGFloat, isFinal: Bool) {
+        guard width > 0, !model.pages.isEmpty else { return }
+
+        let fraction = min(max(0, x / width), 1)
+        if !isScrubbing {
+            isScrubbing = true
+            // A scrub is a deliberate page jump, not a scroll gesture. Clear any
+            // flags left by a swipe so the model's page change is allowed to move the
+            // reader immediately.
+            verticalScrollTracker.isUserScrolling = false
+            verticalScrollTracker.isHorizontalScrolling = false
+            verticalScrollTracker.isApplyingModelChange = false
+            revealControls()
+        }
+        scrubFraction = fraction
+
+        let target = ReaderScrubbing.page(
+            atFraction: fraction,
+            pageCount: model.pages.count
+        )
+        if target != model.currentIndex {
+            model.goToPage(target, save: false, resetZoom: false, prefetch: false)
+        }
+
+        if isFinal {
+            model.prefetchAroundCurrentPage()
+            model.flushProgress()
+            scrubFraction = ReaderScrubbing.fraction(
+                ofPage: model.currentIndex,
+                pageCount: model.pages.count
+            )
+            isScrubbing = false
+            revealControls()
+        }
     }
 
     // MARK: - Controls
