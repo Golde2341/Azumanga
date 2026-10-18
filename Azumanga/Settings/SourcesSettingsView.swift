@@ -209,15 +209,52 @@ private struct SourceBrowserSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var searchText = ""
-    @State private var showDisabled = false
+    @State private var showAllSources = false
+    @State private var languageFilter = "all"
+    @State private var categoryFilter = "all"
+    @State private var isUpdatingSelection = false
     @State private var configurationTarget: SourceManifest?
     @State private var removalTarget: SourceInfo?
 
     private var filteredSources: [SourceInfo] {
         model.visibleSources(
-            includeDisabled: showDisabled,
+            includeDisabled: showAllSources,
             query: searchText
         )
+        .filter { source in
+            languageFilter == "all"
+                || source.language.caseInsensitiveCompare(languageFilter) == .orderedSame
+        }
+        .filter { source in
+            categoryFilter == "all"
+                || SourceContentType.category(for: source.contentType).rawValue == categoryFilter
+        }
+    }
+
+    private var availableLanguages: [String] {
+        Array(Set(model.sources.map(\.language)))
+            .sorted {
+                languageName($0).localizedStandardCompare(languageName($1))
+                    == .orderedAscending
+            }
+    }
+
+    private func languageName(_ code: String) -> String {
+        if code.caseInsensitiveCompare("multi") == .orderedSame {
+            return "Multilingual"
+        }
+        return Locale.current.localizedString(forIdentifier: code)
+            ?? code.uppercased()
+    }
+
+    private func setEnabledForFiltered(_ enabled: Bool) {
+        let ids = Set(filteredSources.map(\.id))
+        guard !ids.isEmpty else { return }
+        isUpdatingSelection = true
+        Task {
+            await model.setEnabled(enabled, sourceIds: ids)
+            isUpdatingSelection = false
+        }
     }
 
     var body: some View {
@@ -260,11 +297,58 @@ private struct SourceBrowserSheet: View {
                 .padding(.vertical, 7)
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
 
-                Toggle("Show disabled sources", isOn: $showDisabled)
+                Toggle("Show all sources", isOn: $showAllSources)
                     .toggleStyle(.checkbox)
                     .fixedSize()
             }
             .padding(.horizontal, 18)
+
+            HStack(spacing: 10) {
+                Picker("Language", selection: $languageFilter) {
+                    Text("All languages").tag("all")
+                    ForEach(availableLanguages, id: \.self) { language in
+                        Text(languageName(language)).tag(language)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(minWidth: 145, alignment: .leading)
+
+                Picker("Category", selection: $categoryFilter) {
+                    Text("All categories").tag("all")
+                    ForEach(SourceContentType.allCases) { contentType in
+                        Text(contentType.displayName).tag(contentType.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(minWidth: 145, alignment: .leading)
+
+                Spacer()
+
+                Button("Select All") {
+                    setEnabledForFiltered(true)
+                }
+                .disabled(
+                    isUpdatingSelection
+                        || filteredSources.isEmpty
+                        || filteredSources.allSatisfy(\.isEnabled)
+                )
+
+                Button("Deselect All") {
+                    setEnabledForFiltered(false)
+                }
+                .disabled(
+                    isUpdatingSelection
+                        || filteredSources.isEmpty
+                        || filteredSources.allSatisfy { !$0.isEnabled }
+                )
+
+                if isUpdatingSelection {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 8)
 
             HStack {
                 Text("\(filteredSources.count) sources")
@@ -288,9 +372,9 @@ private struct SourceBrowserSheet: View {
                     searchText.isEmpty ? "No Sources" : "No Matching Sources",
                     systemImage: "magnifyingglass",
                     description: Text(
-                        showDisabled
-                            ? "No providers match this search."
-                            : "No enabled providers match this search. Turn on “Show disabled sources” to search all providers."
+                        showAllSources
+                            ? "No providers match these filters."
+                            : "No enabled providers match these filters. Turn on “Show all sources” to search all providers."
                     )
                 )
                 .frame(maxHeight: .infinity)

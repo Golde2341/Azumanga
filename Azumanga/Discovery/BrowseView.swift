@@ -96,7 +96,7 @@ struct BrowseView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 200)
+            .fixedSize()
         }
 
         ToolbarItem(placement: .automatic) {
@@ -105,13 +105,7 @@ struct BrowseView: View {
                 set: { newValue in Task { await model.selectSource(newValue) } }
             )) {
                 ForEach(model.sourcePicker) { source in
-                    if source.isPinned {
-                        Label(source.name, systemImage: "pin.fill")
-                            .tag(source.id)
-                    } else {
-                        Text(source.name)
-                            .tag(source.id)
-                    }
+                    Text(source.name).tag(source.id)
                 }
             }
             .frame(minWidth: 140)

@@ -114,6 +114,20 @@ final class SourcesModel {
         await refresh()
     }
 
+    func setEnabled(_ isEnabled: Bool, sourceIds: Set<String>) async {
+        guard !sourceIds.isEmpty else { return }
+        for id in sourceIds {
+            await services.registry.setEnabled(isEnabled, id: id)
+        }
+        do {
+            try services.sourceStore.setEnabled(isEnabled, sourceIds: sourceIds)
+            errorMessage = nil
+        } catch {
+            errorMessage = userFacingMessage(for: error)
+        }
+        await refresh()
+    }
+
     /// Keeps the parser sources for the selected locales and content types
     /// enabled, and switches the rest off. MangaDex is native and
     /// language-independent, so it is left to the registry.
