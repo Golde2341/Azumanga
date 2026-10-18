@@ -263,7 +263,12 @@ final class ReaderModel {
 
     // MARK: - Bookmarks
 
+    /// The bookmark store is not observable, so changing a bookmark would not
+    /// otherwise invalidate views that read `isCurrentPageBookmarked`.
+    private(set) var bookmarkRevision = 0
+
     var isCurrentPageBookmarked: Bool {
+        _ = bookmarkRevision
         guard !pages.isEmpty else { return false }
         return (try? services.bookmarkStore.containsKey(bookmarkKey)) ?? false
     }
@@ -282,6 +287,7 @@ final class ReaderModel {
             chapterTitle: chapter.displayName,
             pageIndex: currentIndex
         )
+        bookmarkRevision &+= 1
     }
 
     // MARK: - Navigation

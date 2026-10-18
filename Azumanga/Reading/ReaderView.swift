@@ -69,6 +69,10 @@ struct ReaderView: View {
     /// Whether AppKit is mid-transition into or out of native full screen. Window chrome
     /// is left alone for the whole transition.
     @State private var isNativeFullScreenTransition = false
+    /// Ignore horizontal page-position callbacks while a full-screen frame change is
+    /// still settling. Re-laying out a lazy horizontal stream at a new window size can
+    /// move it by a page; that movement must not advance the reader's model.
+    @State private var pageSyncSuppressedUntil: Date = .distantPast
     /// Counts native full screen transitions, so a settle that finishes late cannot
     /// clear the flag for a transition that has started since.
     @State private var nativeFullScreenGeneration = 0
@@ -124,8 +128,23 @@ struct ReaderView: View {
     @State private var isMagnifying = false
     /// The zoom the current pinch started from, so repeated pinches accumulate.
     @State private var zoomGestureBase: CGFloat = 1
-    /// The point under the pointer when a pinch starts, used to keep it there.
+    /// The content position at the top of the viewport when a pinch starts. Keeping
+    /// it fixed is what prevents a layout zoom from scrolling the webtoon.
     @State private var zoomAnchor: ReaderZoomAnchor?
+    /// Re-applies the zoom anchor after SwiftUI commits the new page heights.
+    @State private var zoomApplyTask: Task<Void, Never>?
+    /// The document offset a zoom change should land on. Applied as soon as the
+    /// scroll view reports the matching content height, so size and position change
+    /// together instead of the content sliding first.
+    @State private var pendingZoomTargetY: CGFloat?
+    /// Repeats that adjustment while a pinch is live. Layout and scroll updates can
+    /// arrive in either order, so pinning the target for the duration is what makes
+    /// the stream hold still instead of sliding under the gesture.
+    @State private var zoomPinTask: Task<Void, Never>?
+    /// Keeps page tracking from reading the transient positions produced while a
+    /// pinch is changing every page's height.
+    @State private var isZoomSettling = false
+    @State private var zoomSettleTask: Task<Void, Never>?
     /// Whether the corner grip is driving the window size. The controls must stay
     /// visible while it is.
     @State private var isResizingWindow = false
@@ -285,7 +304,7 @@ struct ReaderView: View {
         .onKeyPress(.escape) {
             // Escape leaves full screen first, the way it does in a native full
             // screen window; only an ordinary window closes the reader.
-            if isReaderFullScreen {
+            if isReaderFullScreen || isNativeFullScreen {
                 toggleFullScreen()
             } else {
                 model.flushProgress()
@@ -409,6 +428,18 @@ struct ReaderView: View {
                     guard generation == nativeFullScreenGeneration else { return }
                     isNativeFullScreenTransition = false
                     reconcileWindow(window)
+                    // Resizing into and out of native full screen can move a lazy
+                    // horizontal scroll view by a page. Position callbacks are ignored
+                    // during the transition, so put the scroll view back on the page
+                    // the model actually has open.
+                    syncHorizontalPosition(animated: false)
+                    // The lazy stack can settle a beat after the window does. Repeat
+                    // once more while page-position updates are still suppressed.
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(200))
+                        guard generation == nativeFullScreenGeneration else { return }
+                        syncHorizontalPosition(animated: false)
+                    }
                 }
             }
         }
@@ -476,13 +507,27 @@ struct ReaderView: View {
             windowResizeDelegate.detach()
             episodeShapeTask?.cancel()
             verticalScrollTracker.applyTask?.cancel()
+            zoomApplyTask?.cancel()
+            zoomPinTask?.cancel()
+            zoomSettleTask?.cancel()
             model.flushProgress()
         }
+    }
+
+    /// Ignores scroll-driven page updates while a full-screen frame transition and the
+    /// layout it triggers are still settling.
+    private var isPageSyncSuppressed: Bool {
+        Date() < pageSyncSuppressedUntil
+    }
+
+    private func suppressPageSync(for interval: TimeInterval) {
+        pageSyncSuppressedUntil = Date().addingTimeInterval(interval)
     }
 
     /// Marks AppKit's native full screen transition as in flight. Window chrome is left
     /// alone until the matching `did…` notification has unwound.
     private func beginNativeFullScreenTransition() {
+        suppressPageSync(for: 1.2)
         nativeFullScreenGeneration += 1
         isNativeFullScreenTransition = true
         windowResizeDelegate.isEnabled = false
@@ -500,6 +545,7 @@ struct ReaderView: View {
               let screen = window.screen ?? NSScreen.main
         else { return }
 
+        suppressPageSync(for: 0.8)
         isFullScreenAnimating = true
         fullScreenState.generation &+= 1
         let generation = fullScreenState.generation
@@ -554,6 +600,7 @@ struct ReaderView: View {
     /// Puts the window back where it was and hands the menu bar and Dock back.
     private func exitReaderFullScreen(_ window: NSWindow) {
         guard isReaderFullScreen, !isFullScreenAnimating else { return }
+        suppressPageSync(for: 0.8)
         isFullScreenAnimating = true
         fullScreenState.generation &+= 1
         let generation = fullScreenState.generation
@@ -591,6 +638,7 @@ struct ReaderView: View {
             self.windowedFrame = nil
             updateWindowResizeLock()
             reconcileWindow(window)
+            syncHorizontalPosition(animated: false)
         }
     }
 
@@ -873,6 +921,21 @@ struct ReaderView: View {
                 .onChange(of: pendingScrollPageID) { _, _ in
                     performPendingScroll(proxy)
                 }
+                // The document view grows or shrinks in one layout pass. Apply the
+                // pending zoom offset at that exact moment, before the new size is
+                // drawn, rather than waiting for a timer.
+                .task(id: verticalScrollView.map { ObjectIdentifier($0) }) {
+                    guard let scrollView = verticalScrollView,
+                          let documentView = scrollView.documentView
+                    else { return }
+
+                    for await _ in NotificationCenter.default.notifications(
+                        named: NSView.frameDidChangeNotification,
+                        object: documentView
+                    ) {
+                        applyPendingZoomTarget()
+                    }
+                }
                 .onAppear {
                     // A freshly mounted scroll view is not mid-gesture. Clear any
                     // flags left behind if the reader was replaced during a scroll.
@@ -945,6 +1008,7 @@ struct ReaderView: View {
     /// bookkeeping changes here; the model follows after the scroll pauses.
     private func trackVerticalPage(_ tops: [ReaderPageID: CGFloat]) {
         guard !isMagnifying,
+              !isZoomSettling,
               !verticalScrollTracker.isRestoring,
               !tops.isEmpty
         else { return }
@@ -978,6 +1042,7 @@ struct ReaderView: View {
         guard !verticalScrollTracker.isUserScrolling,
               !verticalScrollTracker.isRestoring,
               !isMagnifying,
+              !isZoomSettling,
               let id = verticalScrollTracker.topPageID,
               let section = sections.first(where: { $0.chapterId == id.chapterId }),
               let pagePosition = section.pages.firstIndex(where: { $0.index == id.pageIndex }),
@@ -1201,7 +1266,7 @@ struct ReaderView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 230)
+        .frame(height: Self.verticalChapterBreakHeight)
         .padding(.horizontal, 24)
     }
 
@@ -1359,6 +1424,10 @@ struct ReaderView: View {
     /// the next episode fetching; spreads move the model to the chapter they belong
     /// to without touching the loaded sections or the scroll position.
     private func handleHorizontalPosition(_ id: ReaderStreamItemID?) {
+        guard !isNativeFullScreenTransition,
+              !isFullScreenAnimating,
+              !isPageSyncSuppressed
+        else { return }
         guard let id else { return }
 
         switch id {
@@ -1415,6 +1484,10 @@ struct ReaderView: View {
     /// Deliberate page turn: one spread, which is one page in single-page mode and a
     /// facing pair in double-page mode.
     private func turnSpread(_ direction: Int) {
+        guard !isNativeFullScreenTransition,
+              !isFullScreenAnimating,
+              !isPageSyncSuppressed
+        else { return }
         guard settings.layout == .horizontal else {
             turnVerticalPage(direction)
             return
@@ -1598,65 +1671,190 @@ struct ReaderView: View {
             }
     }
 
-    /// Enables the scroll view's magnification used by the vertical reader. The pinch
-    /// itself is handled by `verticalZoomGesture`, which applies the zoom at the
-    /// pointer; programmatic zoom still works while user magnification is off.
-    /// The vertical reader's pinch. Layout zoom keeps the lazy stack's page rendering
-    /// in step with what is visible; when the pinch ends the scroll offset is moved so
-    /// the point that was under the pointer is under it again.
+    /// The vertical reader's pinch. Layout zoom changes every page's height, so the
+    /// scroll view has to be moved by exactly the same amount or the stream appears to
+    /// scroll under the fingers. The anchor records the item at the viewport's top and
+    /// the fraction through it, which is accurate even across a fixed-height chapter
+    /// break.
     private var verticalZoomGesture: some Gesture {
         MagnifyGesture()
             .onChanged { value in
+                var anchor = zoomAnchor
                 if !isMagnifying {
                     isMagnifying = true
+                    isZoomSettling = true
+                    pendingZoomTargetY = nil
+                    zoomSettleTask?.cancel()
+                    // Safety net: page tracking eventually resumes even if the gesture
+                    // ends without delivering its final event.
+                    zoomSettleTask = Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(10))
+                        guard !Task.isCancelled else { return }
+                        zoomPinTask?.cancel()
+                        isZoomSettling = false
+                        pendingZoomTargetY = nil
+                    }
+                    zoomPinTask?.cancel()
+                    zoomPinTask = Task { @MainActor in
+                        while !Task.isCancelled {
+                            applyPendingZoomTarget()
+                            try? await Task.sleep(for: .milliseconds(8))
+                        }
+                    }
                     zoomGestureBase = model.zoom
-                    zoomAnchor = captureZoomAnchor(zoom: model.zoom)
+                    anchor = captureZoomAnchor(zoom: model.zoom)
+                    zoomAnchor = anchor
                 }
                 model.setZoom(zoomGestureBase * value.magnification)
+                if let anchor {
+                    applyZoomAnchor(anchor)
+                }
             }
             .onEnded { _ in
-                restoreZoomAnchor()
+                if let anchor = zoomAnchor {
+                    applyZoomAnchor(anchor, final: true)
+                }
                 zoomGestureBase = model.zoom
+                zoomAnchor = nil
                 isMagnifying = false
+                zoomSettleTask?.cancel()
+                zoomSettleTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(180))
+                    guard !Task.isCancelled else { return }
+                    // One last correction, then stop pinning the clip view.
+                    applyPendingZoomTarget()
+                    zoomPinTask?.cancel()
+                    zoomPinTask = nil
+                    isZoomSettling = false
+                    pendingZoomTargetY = nil
+                }
             }
     }
 
-    private func captureZoomAnchor(zoom: CGFloat) -> ReaderZoomAnchor? {
-        guard let scrollView = verticalScrollView,
-              let window = scrollView.window
-        else { return nil }
-
-        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
-        let clip = scrollView.contentView
-        let documentPoint = clip.convert(windowPoint, from: nil)
-        let viewportPoint = NSPoint(
-            x: documentPoint.x - clip.bounds.origin.x,
-            y: documentPoint.y - clip.bounds.origin.y
-        )
-        return ReaderZoomAnchor(
-            documentPoint: documentPoint,
-            viewportPoint: viewportPoint,
-            zoom: zoom
-        )
+    private func capturedPageHeight(zoom: CGFloat, width: CGFloat) -> CGFloat {
+        let aspect = min(max(verticalPageAspect ?? Self.typicalPageAspectRatio, 0.2), 5)
+        return (width * zoom) / aspect
     }
 
-    private func restoreZoomAnchor() {
-        guard let anchor = zoomAnchor, let scrollView = verticalScrollView else {
-            zoomAnchor = nil
-            return
+    /// Finds the page or chapter break crossing the viewport's top edge, and how far
+    /// into it that edge is.
+    private func captureZoomAnchor(zoom: CGFloat) -> ReaderZoomAnchor? {
+        guard let scrollView = verticalScrollView, !sections.isEmpty else { return nil }
+
+        let clip = scrollView.contentView
+        let pageHeight = capturedPageHeight(zoom: zoom, width: clip.bounds.width)
+        guard pageHeight > 0 else { return nil }
+
+        let breakHeight = Self.verticalChapterBreakHeight
+        var remaining = max(0, clip.bounds.origin.y)
+
+        for section in sections {
+            let pagesHeight = pageHeight * CGFloat(section.pages.count)
+            if remaining < pagesHeight {
+                let rawIndex = Int(remaining / pageHeight)
+                let index = min(max(rawIndex, 0), max(section.pages.count - 1, 0))
+                guard section.pages.indices.contains(index) else { return nil }
+                let top = CGFloat(index) * pageHeight
+                return ReaderZoomAnchor(
+                    position: .page(
+                        chapterId: section.chapterId,
+                        pageIndex: section.pages[index].index,
+                        fraction: (remaining - top) / pageHeight
+                    ),
+                    zoom: zoom
+                )
+            }
+            remaining -= pagesHeight
+
+            if remaining < breakHeight {
+                return ReaderZoomAnchor(
+                    position: .chapterBreak(
+                        chapterId: section.chapterId,
+                        fraction: remaining / breakHeight
+                    ),
+                    zoom: zoom
+                )
+            }
+            remaining -= breakHeight
         }
-        zoomAnchor = nil
 
-        let ratio = model.zoom / anchor.zoom
-        guard ratio.isFinite, ratio > 0 else { return }
+        return nil
+    }
 
-        let origin = NSPoint(
-            x: anchor.documentPoint.x * ratio - anchor.viewportPoint.x,
-            y: anchor.documentPoint.y * ratio - anchor.viewportPoint.y
+    /// Reconstructs the same anchor's document offset at a new zoom. Page heights
+    /// scale with zoom; chapter-break heights do not.
+    private func zoomAnchorOffset(
+        _ anchor: ReaderZoomAnchor,
+        zoom: CGFloat,
+        width: CGFloat
+    ) -> CGFloat? {
+        let pageHeight = capturedPageHeight(zoom: zoom, width: width)
+        guard pageHeight > 0 else { return nil }
+
+        let breakHeight = Self.verticalChapterBreakHeight
+        var offset: CGFloat = 0
+
+        for section in sections {
+            switch anchor.position {
+            case let .page(chapterId, pageIndex, fraction):
+                if section.chapterId == chapterId {
+                    guard let index = section.pages.firstIndex(where: { $0.index == pageIndex }) else {
+                        return offset
+                    }
+                    return offset + CGFloat(index) * pageHeight + fraction * pageHeight
+                }
+            case let .chapterBreak(chapterId, fraction):
+                if section.chapterId == chapterId {
+                    return offset + CGFloat(section.pages.count) * pageHeight + fraction * breakHeight
+                }
+            }
+
+            offset += CGFloat(section.pages.count) * pageHeight + breakHeight
+        }
+
+        return nil
+    }
+
+    /// Applies the pending offset as soon as the scroll view reports its new content
+    /// height. Doing this in the frame-change notification keeps the size and position
+    /// changes in the same layout pass instead of letting the content slide first.
+    private func applyPendingZoomTarget() {
+        guard let targetY = pendingZoomTargetY,
+              let scrollView = verticalScrollView
+        else { return }
+
+        let clip = scrollView.contentView
+        let maxY = max(0, clip.documentRect.height - clip.bounds.height)
+        // A zoom-in's target can temporarily sit past the old content height. Setting
+        // it now would clamp to the bottom; wait for the document to grow instead.
+        guard targetY <= maxY + 0.5 else { return }
+        let target = max(0, targetY)
+        guard abs(clip.bounds.origin.y - target) > 0.25 else { return }
+        clip.setBoundsOrigin(
+            NSPoint(x: clip.bounds.origin.x, y: target)
         )
-        Task { @MainActor in
-            scrollView.contentView.setBoundsOrigin(origin)
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+        scrollView.reflectScrolledClipView(clip)
+    }
+
+    /// Schedules the anchored position for a new zoom. The document-frame observer
+    /// normally applies it in the same layout pass as the page-height change; the
+    /// timer passes are a fallback for geometry the observer cannot see.
+    private func applyZoomAnchor(_ anchor: ReaderZoomAnchor, final: Bool = false) {
+        guard let scrollView = verticalScrollView else { return }
+        let width = scrollView.contentView.bounds.width
+        guard width > 0,
+              let targetY = zoomAnchorOffset(anchor, zoom: model.zoom, width: width)
+        else { return }
+
+        pendingZoomTargetY = targetY
+        zoomApplyTask?.cancel()
+        zoomApplyTask = Task { @MainActor in
+            let delays: [Int] = final ? [16, 80] : [8]
+            for delay in delays {
+                try? await Task.sleep(for: .milliseconds(delay))
+                guard !Task.isCancelled else { return }
+                applyPendingZoomTarget()
+            }
         }
     }
 
@@ -1957,12 +2155,23 @@ struct ReaderView: View {
     }
 
     private var fullScreenControl: some View {
-        Button {
+        let isFullScreen = isReaderFullScreen || isNativeFullScreen
+
+        return Button {
             toggleFullScreen()
         } label: {
-            Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
+            Label(
+                isFullScreen ? "Exit Full Screen" : "Full Screen",
+                systemImage: isFullScreen
+                    ? "arrow.down.right.and.arrow.up.left"
+                    : "arrow.up.left.and.arrow.down.right"
+            )
         }
-        .help("Exclusive full screen (F) — the green button uses native full screen")
+        .help(
+            isFullScreen
+                ? "Exit full screen (F)"
+                : "Full screen (F) — the green button uses native full screen"
+        )
     }
 
     // MARK: - Display options
@@ -2054,14 +2263,17 @@ struct ReaderView: View {
     }
 
     private func toggleFullScreen() {
-        // The green button and the View menu own native full screen; this toggle is the
-        // reader's own screen-filling mode, and the two do not overlap.
-        guard let window,
-              !isNativeFullScreen,
-              !isNativeFullScreenTransition,
-              !isFullScreenAnimating,
-              !window.styleMask.contains(.fullScreen)
-        else { return }
+        guard let window, !isNativeFullScreenTransition else { return }
+
+        // In native full screen, F and the control-bar button leave it the same way
+        // the green button does. AppKit owns this transition; the reader's own
+        // screen-filling mode is only used from an ordinary window.
+        if isNativeFullScreen || window.styleMask.contains(.fullScreen) {
+            window.toggleFullScreen(nil)
+            return
+        }
+
+        guard !isFullScreenAnimating else { return }
 
         if isReaderFullScreen {
             exitReaderFullScreen(window)
@@ -2385,6 +2597,9 @@ struct ReaderView: View {
 
     /// Stand-in proportions, used until a page has loaded.
     private static let typicalPageAspectRatio: CGFloat = 2.0 / 3.0
+    /// Fixed height of the separator between loaded chapters. The vertical zoom
+    /// anchor needs the same value the layout uses.
+    private static let verticalChapterBreakHeight: CGFloat = 230
 
     /// Shapes the window to the pages it is showing, so a spread or a single page fills
     /// it instead of being letterboxed inside it.
@@ -2888,11 +3103,17 @@ private struct ReaderHorizontalItem: Identifiable {
     let isBreak: Bool
 }
 
-/// A point on the page, the matching point in the viewport, and the zoom it was
-/// captured at — used to keep the page under the pointer while zooming.
+/// The page or chapter break at the viewport's top edge when a webtoon pinch
+/// began, plus the fraction through it and the zoom it was captured at. The page
+/// layout is deterministic, so this can be mapped exactly to a new scroll offset
+/// when the zoom changes.
 private struct ReaderZoomAnchor {
-    let documentPoint: CGPoint
-    let viewportPoint: CGPoint
+    enum Position {
+        case page(chapterId: String, pageIndex: Int, fraction: CGFloat)
+        case chapterBreak(chapterId: String, fraction: CGFloat)
+    }
+
+    let position: Position
     let zoom: CGFloat
 }
 
