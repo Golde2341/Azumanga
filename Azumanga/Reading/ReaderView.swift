@@ -121,8 +121,12 @@ struct ReaderView: View {
     @State private var isScrubbing = false
     /// The scroll view backing the vertical reader, used for native magnification.
     @State private var verticalScrollView: NSScrollView?
-    /// Keeps the webtoon's position stable while the window's width changes.
-    @State private var verticalResizeState = ReaderVerticalResizeState()
+    /// The content position at the viewport's top edge when a live window resize
+    /// begins. Recomputing its offset as the page widths change keeps the same
+    /// reading spot under the viewport edge.
+    @State private var resizeAnchor: ReaderZoomAnchor?
+    @State private var resizePinTask: Task<Void, Never>?
+    @State private var resizeSettleTask: Task<Void, Never>?
     /// Whether a pinch is in flight. While the pages change size under the scroll
     /// view, its intermediate positions must not be treated as page turns.
     @State private var isMagnifying = false
@@ -443,29 +447,49 @@ struct ReaderView: View {
                 }
             }
         }
-        // Window resizing changes every vertical page's height. Without anchoring the
-        // scroll position, the pages slide under the pointer while the user is only
-        // changing the window's width.
+        // A live window resize changes every vertical page's height. Anchor the exact
+        // page position at the viewport top and pin it while the width changes, so the
+        // stream cannot slide and the same spot remains after the resize ends.
         .task(id: window) {
             guard let window else { return }
             for await _ in NotificationCenter.default.notifications(
-                named: NSWindow.didResizeNotification,
+                named: NSWindow.willStartLiveResizeNotification,
                 object: window
             ) {
                 guard settings.layout == .vertical,
                       !isReaderFullScreen,
                       !isNativeFullScreen,
-                      !isNativeFullScreenTransition
-                else {
-                    verticalResizeState.lastWidth = nil
-                    continue
-                }
+                      !isNativeFullScreenTransition,
+                      !isFullScreenAnimating
+                else { continue }
 
-                verticalResizeState.applyTask?.cancel()
-                verticalResizeState.applyTask = Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(20))
+                resizeSettleTask?.cancel()
+                resizeAnchor = captureZoomAnchor(zoom: model.zoom)
+                resizePinTask?.cancel()
+                resizePinTask = Task { @MainActor in
+                    while !Task.isCancelled {
+                        applyResizeAnchor()
+                        try? await Task.sleep(for: .milliseconds(8))
+                    }
+                }
+            }
+        }
+        .task(id: window) {
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.didEndLiveResizeNotification,
+                object: window
+            ) {
+                guard resizeAnchor != nil else { continue }
+                // Keep pinning through the last layout pass, then settle and release.
+                resizeSettleTask?.cancel()
+                resizeSettleTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(180))
                     guard !Task.isCancelled else { return }
-                    preserveVerticalScrollDuringResize()
+                    applyResizeAnchor()
+                    resizePinTask?.cancel()
+                    resizePinTask = nil
+                    resizeAnchor = nil
                 }
             }
         }
@@ -510,6 +534,8 @@ struct ReaderView: View {
             zoomApplyTask?.cancel()
             zoomPinTask?.cancel()
             zoomSettleTask?.cancel()
+            resizePinTask?.cancel()
+            resizeSettleTask?.cancel()
             model.flushProgress()
         }
     }
@@ -934,6 +960,7 @@ struct ReaderView: View {
                         object: documentView
                     ) {
                         applyPendingZoomTarget()
+                        applyResizeAnchor()
                     }
                 }
                 .onAppear {
@@ -948,10 +975,6 @@ struct ReaderView: View {
                         pendingScrollPageID = id
                     }
                     performPendingScroll(proxy)
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .milliseconds(60))
-                        updateVerticalResizeBaseline()
-                    }
                 }
                 .scrollIndicators(.never)
                 .gesture(verticalZoomGesture)
@@ -2419,40 +2442,28 @@ struct ReaderView: View {
         windowResizeDelegate.isEnabled = enabled
     }
 
-    private func updateVerticalResizeBaseline() {
-        guard let scrollView = verticalScrollView else { return }
-        let width = scrollView.contentView.bounds.width
-        if width > 0 {
-            verticalResizeState.lastWidth = width
-        }
-    }
-
-    /// Page heights are proportional to the viewport width, so a window-resize event
-    /// must move the clip view by the same ratio to keep the page under the viewport
-    /// top in place. Without this, the unchanged content offset looks like the pages
-    /// are scrolling by themselves.
-    private func preserveVerticalScrollDuringResize() {
+    /// Maps the resize anchor to the current page-width layout and moves the clip
+    /// view there. While the live resize is in progress, the pin task repeats this
+    /// so page-height changes and the scroll offset stay together.
+    private func applyResizeAnchor() {
         guard settings.layout == .vertical,
+              let anchor = resizeAnchor,
               let scrollView = verticalScrollView
         else { return }
 
         let clip = scrollView.contentView
         let width = clip.bounds.width
-        guard width > 0 else { return }
+        guard width > 0,
+              let targetY = zoomAnchorOffset(anchor, zoom: model.zoom, width: width)
+        else { return }
 
-        guard let lastWidth = verticalResizeState.lastWidth, lastWidth > 0 else {
-            verticalResizeState.lastWidth = width
-            return
-        }
-        guard abs(width - lastWidth) > 0.1 else { return }
+        let maxY = max(0, clip.documentRect.height - clip.bounds.height)
+        guard targetY <= maxY + 0.5 else { return }
 
-        let ratio = width / lastWidth
-        let origin = clip.bounds.origin
-        clip.setBoundsOrigin(
-            NSPoint(x: origin.x, y: origin.y * ratio)
-        )
+        let target = max(0, targetY)
+        guard abs(clip.bounds.origin.y - target) > 0.25 else { return }
+        clip.setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: target))
         scrollView.reflectScrolledClipView(clip)
-        verticalResizeState.lastWidth = width
     }
 
     /// A page's width over its height, read from a page of the current spread that has
@@ -3019,12 +3030,6 @@ private struct ReaderResizeGrip: NSViewRepresentable {
             onEnded?()
         }
     }
-}
-
-/// Tracks the last viewport width used by the webtoon resize anchor.
-private final class ReaderVerticalResizeState {
-    var lastWidth: CGFloat?
-    var applyTask: Task<Void, Never>?
 }
 
 /// Vertical reader page tracking that does not invalidate the view when it changes.
