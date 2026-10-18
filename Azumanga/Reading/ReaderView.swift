@@ -1822,15 +1822,18 @@ struct ReaderView: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.top, controlBarTopPadding)
-        // A soft shadow lifts the floating bar off the page while the controls are up;
-        // it fades away with them.
-        .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 6)
+        // Measure the bar itself, before the top padding that positions it. Including
+        // that padding here would feed its own offset back into the height calculation
+        // and leave the bar a few pixels above the traffic-light centre line.
         .onGeometryChange(for: CGFloat.self) { bar in
             bar.size.height
         } action: { height in
             controlBarHeight = height
         }
+        .padding(.top, controlBarTopPadding)
+        // A soft shadow lifts the floating bar off the page while the controls are up;
+        // it fades away with them.
+        .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 6)
     }
 
     /// Puts the control bar's centre line on the traffic lights' centre line, so the lights
