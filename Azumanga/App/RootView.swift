@@ -34,6 +34,7 @@ struct RootView: View {
     @AppStorage("hasCompletedWelcome") private var hasCompletedWelcome = false
     @State private var selection: SidebarItem? = .library
     @State private var libraryPath = NavigationPath()
+    @State private var showingGlobalSearch = false
 
     private var welcomeBinding: Binding<Bool> {
         Binding(
@@ -46,9 +47,29 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(SidebarItem.allCases, selection: $selection) { item in
-                Label(item.title, systemImage: item.systemImage)
-                    .tag(item)
+            VStack(spacing: 0) {
+                Button {
+                    showingGlobalSearch = true
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                        Text("Global Search")
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Capsule())
+                .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 3)
+                .padding(8)
+
+                List(SidebarItem.allCases, selection: $selection) { item in
+                    Label(item.title, systemImage: item.systemImage)
+                        .tag(item)
+                }
             }
             .navigationSplitViewColumnWidth(min: 190, ideal: 210, max: 260)
         } detail: {
@@ -74,6 +95,9 @@ struct RootView: View {
                 hasCompletedWelcome = true
             }
             .environment(app)
+        }
+        .sheet(isPresented: $showingGlobalSearch) {
+            GlobalSearchView(services: app.services)
         }
         .task {
             await app.bootstrap()

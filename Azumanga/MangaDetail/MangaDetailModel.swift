@@ -35,18 +35,21 @@ final class MangaDetailModel {
         async let detailsTask = try? source.mangaDetails(id: manga.mangaId)
         async let chaptersTask = try? source.chapters(mangaId: manga.mangaId)
 
-        let (fetchedDetails, fetchedChapters) = await (detailsTask, chaptersTask)
+        // Chapters are what the list needs. Apply them before waiting for details so
+        // a slow cover/metadata request cannot hold the episode list behind it.
+        let fetchedChapters = await chaptersTask
+        if let fetchedChapters {
+            chapters = ordered(fetchedChapters)
+        } else {
+            errorMessage = "Could not load this manga. Check your connection and try again."
+        }
 
+        let fetchedDetails = await detailsTask
         if let fetchedDetails {
             details = fetchedDetails
             if isInLibrary {
                 _ = try? services.libraryStore.add(details)
             }
-        }
-        if let fetchedChapters {
-            chapters = ordered(fetchedChapters)
-        } else {
-            errorMessage = "Could not load this manga. Check your connection and try again."
         }
 
         if fetchedDetails == nil && fetchedChapters == nil && errorMessage == nil {

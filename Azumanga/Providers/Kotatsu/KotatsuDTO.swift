@@ -84,6 +84,24 @@ nonisolated struct KotatsuHealthResponse: Decodable, Sendable {
     }
 }
 
+/// Global search across several Kotatsu sources in one host request.
+nonisolated struct KotatsuSearchRequest: Encodable, Sendable {
+    var sources: [String]
+    var query: String
+    var timeoutMs: Int
+}
+
+nonisolated struct KotatsuSearchResponse: Decodable, Sendable {
+    var items: [Item]
+
+    nonisolated struct Item: Decodable, Sendable {
+        var key: String
+        var ok: Bool
+        var detail: String?
+        var items: [KotatsuMangaDTO]?
+    }
+}
+
 nonisolated struct KotatsuFilterOptionsDTO: Decodable, Sendable {
     var sortOrders: [String]
     var capabilities: Capabilities

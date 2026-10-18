@@ -190,6 +190,15 @@ actor KotatsuSource: MangaSource, SourceProbing {
         persistCatalog()
     }
 
+    /// Feeds results from the host's batch global-search endpoint back into the
+    /// source cache, so opening a result can request details using its original
+    /// URL and metadata.
+    func ingestSearchResults(_ items: [KotatsuMangaDTO]) {
+        for item in items {
+            remember(item)
+        }
+    }
+
     private func loadCatalogIfNeeded() {
         guard !catalogLoaded else { return }
         catalogLoaded = true

@@ -55,6 +55,16 @@ struct MangaDetailView: View {
 
     @ViewBuilder
     private func content(_ model: MangaDetailModel) -> some View {
+        let chapters = visibleChapters(model)
+        let progressByChapter = Dictionary(
+            progressRecords.map { ($0.chapterId, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let downloadsByKey = Dictionary(
+            downloads.records.map { ($0.key, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
         List {
             Section {
                 header(model)
@@ -78,8 +88,11 @@ struct MangaDetailView: View {
                 }
             } else {
                 Section {
-                    ForEach(visibleChapters(model)) { chapter in
+                    ForEach(chapters) { chapter in
                         let isSelected = selectedChapterIDs.contains(chapter.chapterId)
+                        let progress = progressByChapter[chapter.chapterId]
+                        let chapterIsRead = progress?.status == .completed
+                        let downloadState = downloadsByKey[downloadKey(chapter)]?.state
 
                         Button {
                             if isSelectingChapters {
@@ -103,9 +116,9 @@ struct MangaDetailView: View {
 
                                 ChapterRow(
                                     chapter: chapter,
-                                    isRead: isRead(chapter),
-                                    progress: progress(for: chapter),
-                                    downloadState: downloads.state(of: chapter)
+                                    isRead: chapterIsRead,
+                                    progress: progress,
+                                    downloadState: downloadState
                                 )
                             }
                             .contentShape(Rectangle())
@@ -125,8 +138,8 @@ struct MangaDetailView: View {
                         .buttonStyle(.plain)
                         .listRowBackground(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
                         .contextMenu {
-                            Button(isRead(chapter) ? "Mark as Unread" : "Mark as Read") {
-                                model.toggleRead(chapter, isRead: isRead(chapter))
+                            Button(chapterIsRead ? "Mark as Unread" : "Mark as Read") {
+                                model.toggleRead(chapter, isRead: chapterIsRead)
                             }
                             Divider()
                             downloadActions(for: chapter, model: model)
@@ -198,10 +211,6 @@ struct MangaDetailView: View {
         progressRecords.first { $0.chapterId == chapter.chapterId }
     }
 
-    private func isRead(_ chapter: Chapter) -> Bool {
-        progress(for: chapter)?.status == .completed
-    }
-
     private var readCount: Int {
         progressRecords.count { $0.status == .completed }
     }
@@ -216,8 +225,13 @@ struct MangaDetailView: View {
     }
 
     private func visibleChapters(_ model: MangaDetailModel) -> [Chapter] {
-        let ordered = model.ordered(model.chapters)
-        return chapterSortAscending ? ordered : ordered.reversed()
+        chapterSortAscending
+            ? model.chapters
+            : Array(model.chapters.reversed())
+    }
+
+    private func downloadKey(_ chapter: Chapter) -> String {
+        "\(chapter.sourceId):\(chapter.mangaId):\(chapter.chapterId)"
     }
 
     // MARK: - Batch read state
@@ -379,10 +393,25 @@ struct MangaDetailView: View {
 
     private func header(_ model: MangaDetailModel) -> some View {
         HStack(alignment: .top, spacing: 18) {
-            CoverImage(url: model.details.coverURL, maxPixelSize: 640)
-                .frame(width: 150, height: 225)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .shadow(radius: 4, y: 2)
+            Group {
+                if model.isLoading && model.chapters.isEmpty {
+                    // The Kotatsu host serializes requests; starting the cover image
+                    // here can put a large poster ahead of the chapter/details call.
+                    // Show the placeholder until the episode list is on its way.
+                    Rectangle()
+                        .fill(.quaternary)
+                        .overlay {
+                            Image(systemName: "photo")
+                                .font(.title2)
+                                .foregroundStyle(.secondary)
+                        }
+                } else {
+                    CoverImage(url: model.details.coverURL, maxPixelSize: 640)
+                }
+            }
+            .frame(width: 150, height: 225)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .shadow(radius: 4, y: 2)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text(model.details.title)
@@ -478,7 +507,12 @@ struct MangaDetailView: View {
         ToolbarItem(placement: .automatic) {
             Menu {
                 Button("Download Unread Chapters") {
-                    let unread = model.chapters.filter { !isRead($0) }
+                    let read = Set(
+                        progressRecords.lazy
+                            .filter { $0.status == .completed }
+                            .map(\.chapterId)
+                    )
+                    let unread = model.chapters.filter { !read.contains($0.chapterId) }
                     downloadChapters(unread, model: model)
                 }
                 Button("Download All Chapters") {

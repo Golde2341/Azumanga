@@ -119,6 +119,7 @@ class ParserHost(
 
         "sources" -> sources()
         "health" -> health(params)
+        "search" -> search(params)
         "list" -> list(params)
         "details" -> details(params)
         "pages" -> pages(params)
@@ -186,6 +187,58 @@ class ParserHost(
                 .put("count", mangas.size)
                 .put("detail", "${mangas.size} results")
         }
+    } catch (error: Throwable) {
+        JSONObject()
+            .put("key", key)
+            .put("ok", false)
+            .put("detail", error.message ?: error.javaClass.simpleName)
+    }
+
+    /// Search several sources concurrently for the global search screen.
+    private fun search(params: JSONObject): JSONObject = runBlocking {
+        val keysJson = params.optJSONArray("sources") ?: JSONArray()
+        val keys = (0 until keysJson.length()).mapNotNull { index ->
+            keysJson.optString(index).takeIf { it.isNotEmpty() }
+        }
+        val query = params.optString("query").trim()
+        if (keys.isEmpty() || query.isEmpty()) {
+            return@runBlocking JSONObject().put("items", JSONArray())
+        }
+        val perSourceTimeout = params.optLong("timeoutMs", 8_000L)
+            .coerceIn(1_000L, 60_000L)
+        val gate = Semaphore(16)
+        val results = coroutineScope {
+            keys.map { key ->
+                async(Dispatchers.IO) {
+                    gate.withPermit { searchSource(key, query, perSourceTimeout) }
+                }
+            }.awaitAll()
+        }
+        JSONObject().put("items", JSONArray(results))
+    }
+
+    private suspend fun searchSource(key: String, query: String, timeoutMs: Long): JSONObject = try {
+        val source = MangaParserSource.entries.firstOrNull { it.name == key }
+            ?: throw IllegalArgumentException("Unknown source: $key")
+        val parser = healthParser(source)
+        val order = parser.availableSortOrders.firstOrNull() ?: SortOrder.UPDATED
+        val filter = MangaListFilter(
+            query = query,
+            states = emptySet(),
+            contentRating = emptySet(),
+            types = emptySet(),
+            demographics = emptySet(),
+            yearFrom = YEAR_UNKNOWN,
+            yearTo = YEAR_UNKNOWN,
+            author = null,
+        )
+        val mangas = withTimeout(timeoutMs) {
+            parser.getList(0, order, filter)
+        }
+        JSONObject()
+            .put("key", key)
+            .put("ok", true)
+            .put("items", JSONArray(mangas.map { it.toJson() }))
     } catch (error: Throwable) {
         JSONObject()
             .put("key", key)

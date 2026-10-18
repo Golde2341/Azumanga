@@ -1273,17 +1273,17 @@ struct ReaderView: View {
 
         VStack(spacing: 12) {
             Rectangle()
-                .fill(.secondary.opacity(0.25))
+                .fill(Color.white.opacity(0.3))
                 .frame(width: 56, height: 1)
 
             Text("END OF CHAPTER")
                 .font(.caption2.weight(.semibold))
                 .tracking(1.8)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(Color.white.opacity(0.5))
 
             Text(sectionChapter?.displayName ?? "Chapter")
                 .font(.callout.weight(.medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.white.opacity(0.72))
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
 
@@ -1292,9 +1292,10 @@ struct ReaderView: View {
                     Text("NEXT CHAPTER")
                         .font(.caption2)
                         .tracking(1.4)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(Color.white.opacity(0.5))
                     Text(nextChapter.displayName)
                         .font(.headline)
+                        .foregroundStyle(.white)
                         .lineLimit(2)
                         .multilineTextAlignment(.center)
                 }
@@ -1303,6 +1304,7 @@ struct ReaderView: View {
                 if isLoading {
                     ProgressView()
                         .controlSize(.small)
+                        .tint(.white)
                 } else if let externalURL = nextChapter.externalURL {
                     Link("Open on Source Site", destination: externalURL)
                         .font(.caption)
@@ -1314,17 +1316,20 @@ struct ReaderView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .font(.caption)
+                    .tint(.white)
                 }
             } else {
                 Text("You're all caught up")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.white.opacity(0.72))
                     .padding(.top, 10)
             }
         }
+        .environment(\.colorScheme, .dark)
         .frame(maxWidth: .infinity)
         .frame(height: Self.verticalChapterBreakHeight)
         .padding(.horizontal, 24)
+        .background(Color.black)
     }
 
     /// Horizontal paging is the platform's scroll view with one custom decision about
@@ -1431,6 +1436,8 @@ struct ReaderView: View {
         if item.isBreak {
             if let section = sections.first(where: { $0.chapterId == item.chapterId }) {
                 chapterBreak(after: section)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black)
             }
         } else {
             spreadView(item.pages, size: size)
