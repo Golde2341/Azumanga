@@ -82,6 +82,7 @@ final class Services {
         let enabledIds: Set<String>? = hasStoredState
             ? Set(stored.filter(\.isEnabled).map(\.sourceId))
             : nil
+        let pinnedIds = Set(stored.filter(\.isPinned).map(\.sourceId))
 
         let sources = BuiltinSources.make(configuration: settings.mangaDexConfiguration, http: http)
         await registry.register(contentsOf: sources, enabledIds: enabledIds)
@@ -98,6 +99,10 @@ final class Services {
 
         await installer.loadInstalledSources()
         await registerKotatsuSources()
+
+        for id in pinnedIds {
+            await registry.setPinned(true, id: id)
+        }
     }
 
     /// Registers every Kotatsu source the host knows about. Never throws: if the

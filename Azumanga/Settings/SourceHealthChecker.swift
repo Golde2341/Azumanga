@@ -59,18 +59,21 @@ final class SourceHealthChecker {
         task = Task { [weak self] in
             guard let self else { return }
 
-            for info in queue {
-                if Task.isCancelled { break }
-                self.currentSourceName = info.name
+            let handledInBatch = await self.checkKotatsuBatch(queue)
+            if !handledInBatch {
+                for info in queue {
+                    if Task.isCancelled { break }
+                    self.currentSourceName = info.name
 
-                let outcome = await self.check(info)
-                switch outcome.health {
-                case .working: self.workingCount += 1
-                case .failing: self.failingCount += 1
-                case .untested: break
+                    let outcome = await self.check(info)
+                    switch outcome.health {
+                    case .working: self.workingCount += 1
+                    case .failing: self.failingCount += 1
+                    case .untested: break
+                    }
+                    self.apply(outcome, to: info)
+                    self.completed += 1
                 }
-                self.apply(outcome, to: info)
-                self.completed += 1
             }
 
             self.currentSourceName = nil
@@ -91,6 +94,74 @@ final class SourceHealthChecker {
     private struct Outcome {
         var health: SourceHealth
         var detail: String?
+    }
+
+    /// Checks Kotatsu sources in one host call, which runs the probes concurrently.
+    /// Returns false when the batch path is unavailable, so the caller can fall
+    /// back to the ordinary sequential checker.
+    private func checkKotatsuBatch(_ sources: [SourceInfo]) async -> Bool {
+        guard let host = services.kotatsuHost,
+              !sources.isEmpty,
+              sources.allSatisfy({ $0.provider == .kotatsuHost })
+        else { return false }
+
+        let prefix = "kotatsu."
+        let keys = sources.map {
+            String($0.id.dropFirst(prefix.count))
+        }
+        let perSourceTimeoutMilliseconds = 8_000
+        let rounds = max(1, Int(ceil(Double(keys.count) / 24.0)))
+        let hostTimeout = Duration.seconds(rounds * 9 + 10)
+
+        currentSourceName = "Checking \(sources.count) selected sources…"
+
+        do {
+            let response = try await host.call(
+                "health",
+                parameters: KotatsuHealthRequest(
+                    sources: keys,
+                    timeoutMs: perSourceTimeoutMilliseconds
+                ),
+                as: KotatsuHealthResponse.self,
+                timeout: hostTimeout
+            )
+            guard !Task.isCancelled else { return true }
+
+            let results = Dictionary(
+                response.items.map { ($0.key, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+
+            for info in sources {
+                let key = String(info.id.dropFirst(prefix.count))
+                let outcome: Outcome
+                if let result = results[key] {
+                    outcome = Outcome(
+                        health: result.ok ? .working : .failing,
+                        detail: result.detail
+                    )
+                } else {
+                    outcome = Outcome(
+                        health: .failing,
+                        detail: "The parser host did not return a result."
+                    )
+                }
+
+                switch outcome.health {
+                case .working: workingCount += 1
+                case .failing: failingCount += 1
+                case .untested: break
+                }
+                apply(outcome, to: info)
+                completed += 1
+            }
+
+            return true
+        } catch {
+            // An older host without the batch endpoint falls back to sequential
+            // probing rather than marking every source as failed.
+            return Task.isCancelled
+        }
     }
 
     private func check(_ info: SourceInfo) async -> Outcome {

@@ -107,6 +107,7 @@ would hold up every source behind it.
 | --- | --- | --- |
 | `ping` | – | `{protocol, sourceCount}` |
 | `sources` | – | `{items: [{key,title,locale,contentType,broken}]}` |
+| `health` | `{sources: [key], timeoutMs}` | `{items: [{key,ok,count?,detail?}]}` — probes sources concurrently |
 | `list` | `{key, offset, sort?, query?, states?, contentRatings?, types?, demographics?, yearFrom?, yearTo?, author?}` | `{items: [manga]}` |
 | `details` | `{key, manga}` | `manga` including `chapters` |
 | `pages` | `{key, chapter}` | `{items: [{id,url,resolvedUrl,preview}]}` |

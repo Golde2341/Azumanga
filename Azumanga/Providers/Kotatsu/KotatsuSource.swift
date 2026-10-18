@@ -19,6 +19,7 @@ actor KotatsuSource: MangaSource, SourceProbing {
     nonisolated let name: String
     nonisolated let version: String
     nonisolated let language: String
+    nonisolated let contentType: String
     nonisolated let isBuiltIn = false
     nonisolated var providerKind: SourceProviderKind { .kotatsuHost }
     nonisolated let capabilities: Set<SourceCapability> = [
@@ -49,6 +50,7 @@ actor KotatsuSource: MangaSource, SourceProbing {
         self.name = source.title
         self.version = "kotatsu-1.0"
         self.language = source.locale.isEmpty ? "multi" : source.locale
+        self.contentType = source.contentType.isEmpty ? "MANGA" : source.contentType
         self.host = host
         self.callTimeout = callTimeout
         self.catalogFile = catalogDirectory?

@@ -30,6 +30,9 @@ class HostLoaderContext(
     private val userAgent: String = UserAgents.FIREFOX_MOBILE,
     private val domainOverrides: Map<String, String> = emptyMap(),
     parserLookup: (MangaSource) -> MangaParser? = { null },
+    callTimeoutSeconds: Long? = null,
+    connectTimeoutSeconds: Long = 20,
+    readTimeoutSeconds: Long = 45,
 ) : MangaLoaderContext() {
 
     override val cookieJar: InMemoryCookieJar = cookieJar
@@ -37,8 +40,13 @@ class HostLoaderContext(
     override val httpClient: OkHttpClient = OkHttpClient.Builder()
         .cookieJar(this.cookieJar)
         .addInterceptor(CommonHeadersInterceptor(parserLookup))
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
+        .apply {
+            if (callTimeoutSeconds != null) {
+                callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
+            }
+        }
+        .connectTimeout(connectTimeoutSeconds, TimeUnit.SECONDS)
+        .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()

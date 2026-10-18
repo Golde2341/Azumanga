@@ -105,7 +105,13 @@ struct BrowseView: View {
                 set: { newValue in Task { await model.selectSource(newValue) } }
             )) {
                 ForEach(model.sourcePicker) { source in
-                    Text(source.name).tag(source.id)
+                    if source.isPinned {
+                        Label(source.name, systemImage: "pin.fill")
+                            .tag(source.id)
+                    } else {
+                        Text(source.name)
+                            .tag(source.id)
+                    }
                 }
             }
             .frame(minWidth: 140)

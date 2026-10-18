@@ -8,10 +8,8 @@ struct SourcesSettingsView: View {
 
     @State private var showingFileImporter = false
     @State private var showingURLSheet = false
+    @State private var showingSourceBrowser = false
     @State private var manifestURLText = ""
-    @State private var configurationTarget: SourceManifest?
-    @State private var removalTarget: SourceInfo?
-    @State private var showAllKotatsu = false
 
     var body: some View {
         Form {
@@ -21,37 +19,21 @@ struct SourcesSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Built-in") {
-                if model.builtInSources.isEmpty {
-                    Text("No built-in sources registered.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(model.builtInSources) { source in
-                        SourceRow(source: source, manifest: nil, health: nil, onToggle: setEnabled, onConfigure: nil, onRemove: nil)
-                    }
+            Section("Sources") {
+                LabeledContent("Available", value: "\(model.sources.count)")
+                LabeledContent("Enabled", value: "\(model.sources.filter(\.isEnabled).count)")
+                LabeledContent("Pinned", value: "\(model.pinnedCount)")
+
+                Button {
+                    showingSourceBrowser = true
+                } label: {
+                    Label("See Sources…", systemImage: "list.bullet.rectangle")
                 }
             }
 
-            kotatsuSection
+            parserSection
 
-            Section("Installed") {
-                if model.installedSources.isEmpty {
-                    Text("No third-party sources are installed.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(model.installedSources) { source in
-                        SourceRow(
-                            source: source,
-                            manifest: model.manifest(for: source),
-                            health: nil,
-                            healthDetail: nil,
-                            onToggle: setEnabled,
-                            onConfigure: { manifest in configurationTarget = manifest },
-                            onRemove: { _ in removalTarget = source }
-                        )
-                    }
-                }
-
+            Section("Install") {
                 HStack(spacing: 10) {
                     Button {
                         showingFileImporter = true
@@ -117,33 +99,15 @@ struct SourcesSettingsView: View {
         .sheet(isPresented: $showingURLSheet) {
             installFromURLSheet
         }
-        .sheet(item: $configurationTarget) { manifest in
-            ProviderConfigurationSheet(manifest: manifest, model: model)
+        .sheet(isPresented: $showingSourceBrowser) {
+            SourceBrowserSheet()
         }
-        .alert("Remove Provider?", isPresented: Binding(
-            get: { removalTarget != nil },
-            set: { if !$0 { removalTarget = nil } }
-        )) {
-            Button("Cancel", role: .cancel) { removalTarget = nil }
-            Button("Remove", role: .destructive) {
-                if let target = removalTarget {
-                    Task { await model.remove(id: target.id) }
-                }
-                removalTarget = nil
-            }
-        } message: {
-            Text("“\(removalTarget?.name ?? "")” will be deleted. Manga already in your library stays, but reading it will fail until you reinstall the provider.")
-        }
-    }
-
-    private var visibleKotatsuSources: [SourceInfo] {
-        model.kotatsuSources(showAll: showAllKotatsu)
     }
 
     /// Everything the parser library ships, switchable, with a check that finds the
-    /// ones that actually work.
+    /// ones that actually work. Individual rows live under See Sources.
     @ViewBuilder
-    private var kotatsuSection: some View {
+    private var parserSection: some View {
         Section("Kotatsu (parser host)") {
             if let reason = model.kotatsuUnavailableReason {
                 Text(reason)
@@ -155,18 +119,23 @@ struct SourcesSettingsView: View {
             } else {
                 HStack(spacing: 10) {
                     Button {
-                        checker.start(sources: model.kotatsuSources)
+                        checker.start(sources: model.kotatsuSources.filter(\.isEnabled))
                     } label: {
-                        Label("Check All Sources", systemImage: "stethoscope")
+                        Label("Check Selected Sources", systemImage: "stethoscope")
                     }
-                    .disabled(checker.isRunning)
+                    .disabled(
+                        checker.isRunning
+                            || !model.kotatsuSources.contains(where: \.isEnabled)
+                    )
+                    .help("Check the Kotatsu sources currently enabled in See Sources.")
 
                     Button {
-                        checker.start(sources: model.kotatsuSources, onlyUntested: true)
+                        // Kept visible but disabled: checking only untested sources
+                        // is no longer offered.
                     } label: {
                         Label("Check Unchecked", systemImage: "arrow.clockwise")
                     }
-                    .disabled(checker.isRunning)
+                    .disabled(true)
 
                     if checker.isRunning {
                         Button("Stop") { checker.cancel() }
@@ -197,27 +166,7 @@ struct SourcesSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Toggle("Show all sources, including the ones that are broken or unverified", isOn: $showAllKotatsu)
-                    .font(.caption)
-
-                if visibleKotatsuSources.isEmpty {
-                    Text("Nothing to show yet — run a check to find working sources.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(visibleKotatsuSources) { source in
-                        SourceRow(
-                            source: source,
-                            manifest: nil,
-                            health: model.health(of: source),
-                            healthDetail: model.healthDetail(of: source),
-                            onToggle: setEnabled,
-                            onConfigure: nil,
-                            onRemove: nil
-                        )
-                    }
-                }
-
-                Text("These parsers run in a separate process bundled with the app. They can be enabled or disabled here, not installed or removed.")
+                Text("Open See Sources to search, pin, enable or configure individual providers.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -251,9 +200,151 @@ struct SourcesSettingsView: View {
         }
         .padding(24)
     }
+}
 
-    private func setEnabled(_ enabled: Bool, _ id: String) {
-        Task { await model.setEnabled(enabled, id: id) }
+/// Searchable source browser. Disabled sources are hidden by default; the toggle
+/// changes the range the search runs over. Pinned sources sort first.
+private struct SourceBrowserSheet: View {
+    @Environment(SourcesModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var searchText = ""
+    @State private var showDisabled = false
+    @State private var configurationTarget: SourceManifest?
+    @State private var removalTarget: SourceInfo?
+
+    private var filteredSources: [SourceInfo] {
+        model.visibleSources(
+            includeDisabled: showDisabled,
+            query: searchText
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("See Sources")
+                        .font(.title2.weight(.semibold))
+                    Text("Search, enable, pin and configure providers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+
+            HStack(spacing: 12) {
+                HStack(spacing: 7) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search sources", text: $searchText)
+                        .textFieldStyle(.plain)
+                    if !searchText.isEmpty {
+                        Button {
+                            searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 7)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+
+                Toggle("Show disabled sources", isOn: $showDisabled)
+                    .toggleStyle(.checkbox)
+                    .fixedSize()
+            }
+            .padding(.horizontal, 18)
+
+            HStack {
+                Text("\(filteredSources.count) sources")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let error = model.errorMessage {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            if filteredSources.isEmpty {
+                ContentUnavailableView(
+                    searchText.isEmpty ? "No Sources" : "No Matching Sources",
+                    systemImage: "magnifyingglass",
+                    description: Text(
+                        showDisabled
+                            ? "No providers match this search."
+                            : "No enabled providers match this search. Turn on “Show disabled sources” to search all providers."
+                    )
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(filteredSources) { source in
+                        SourceRow(
+                            source: source,
+                            manifest: model.manifest(for: source),
+                            health: source.provider == .kotatsuHost
+                                ? model.health(of: source)
+                                : nil,
+                            healthDetail: source.provider == .kotatsuHost
+                                ? model.healthDetail(of: source)
+                                : nil,
+                            onToggle: { enabled, id in
+                                Task { await model.setEnabled(enabled, id: id) }
+                            },
+                            onPin: { pinned, id in
+                                Task { await model.setPinned(pinned, id: id) }
+                            },
+                            onConfigure: { manifest in
+                                configurationTarget = manifest
+                            },
+                            onRemove: source.provider == .scripted
+                                ? { source in removalTarget = source }
+                                : nil
+                        )
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+        .frame(width: 700, height: 600)
+        .task {
+            await model.refresh()
+        }
+        .sheet(item: $configurationTarget) { manifest in
+            ProviderConfigurationSheet(manifest: manifest, model: model)
+        }
+        .alert("Remove Provider?", isPresented: Binding(
+            get: { removalTarget != nil },
+            set: { if !$0 { removalTarget = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { removalTarget = nil }
+            Button("Remove", role: .destructive) {
+                if let target = removalTarget {
+                    Task { await model.remove(id: target.id) }
+                }
+                removalTarget = nil
+            }
+        } message: {
+            Text("“\(removalTarget?.name ?? "")” will be deleted. Manga already in your library stays, but reading it will fail until you reinstall the provider.")
+        }
     }
 }
 
@@ -263,6 +354,7 @@ private struct SourceRow: View {
     var health: SourceHealth?
     var healthDetail: String?
     let onToggle: (Bool, String) -> Void
+    var onPin: ((Bool, String) -> Void)?
     let onConfigure: ((SourceManifest) -> Void)?
     let onRemove: ((SourceInfo) -> Void)?
 
@@ -275,6 +367,11 @@ private struct SourceRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(source.name)
+                        if source.isPinned {
+                            Image(systemName: "pin.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.tint)
+                        }
                         if let health, let badge = health.badge {
                             Text(badge.text)
                                 .font(.caption2)
@@ -288,6 +385,8 @@ private struct SourceRow: View {
                         Text("v\(source.version)")
                         Text("·")
                         Text(source.language.uppercased())
+                        Text("·")
+                        Text(source.contentType.capitalized)
                         if source.isBuiltIn {
                             Text("· Built-in")
                         }
@@ -306,6 +405,17 @@ private struct SourceRow: View {
             .toggleStyle(.switch)
 
             Spacer()
+
+            if let onPin {
+                Button {
+                    onPin(!source.isPinned, source.id)
+                } label: {
+                    Image(systemName: source.isPinned ? "pin.fill" : "pin")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(source.isPinned ? Color.accentColor : Color.secondary)
+                .help(source.isPinned ? "Unpin source" : "Pin source")
+            }
 
             if let manifest, !manifest.config.isEmpty, let onConfigure {
                 Button {

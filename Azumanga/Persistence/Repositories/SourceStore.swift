@@ -92,6 +92,28 @@ final class SourceStore {
         if context.hasChanges { try context.save() }
     }
 
+    func setEnabled(_ enabled: Bool, sourceIds: Set<String>) throws {
+        guard !sourceIds.isEmpty else { return }
+        for sourceId in sourceIds {
+            guard let record = try preferences(for: sourceId) else { continue }
+            record.isEnabled = enabled
+            record.updatedAt = Date()
+        }
+        if context.hasChanges { try context.save() }
+    }
+
+    func setPinned(_ isPinned: Bool, sourceId: String) throws {
+        guard let record = try preferences(for: sourceId) else { return }
+        record.isPinned = isPinned
+        record.updatedAt = Date()
+        if context.hasChanges { try context.save() }
+    }
+
+    func pinnedSourceIds() throws -> Set<String> {
+        let descriptor = FetchDescriptor<SourcePreferences>(predicate: #Predicate { $0.isPinned })
+        return Set(try context.fetch(descriptor).map(\.sourceId))
+    }
+
     func setConfig(_ config: [String: String], sourceId: String) throws {
         guard let record = try preferences(for: sourceId) else { return }
         record.config = config

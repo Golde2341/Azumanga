@@ -56,6 +56,30 @@ final class SourcesModel {
         kotatsuSources.count { $0.isEnabled }
     }
 
+    var pinnedCount: Int {
+        sources.filter(\.isPinned).count
+    }
+
+    /// Sources shown in Settings → Sources → See Sources. The disabled toggle
+    /// chooses the range the search runs over; pinned sources float to the top.
+    func visibleSources(includeDisabled: Bool, query: String) -> [SourceInfo] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return sources
+            .filter { includeDisabled || $0.isEnabled }
+            .filter { source in
+                guard !trimmed.isEmpty else { return true }
+                return source.name.localizedCaseInsensitiveContains(trimmed)
+                    || source.id.localizedCaseInsensitiveContains(trimmed)
+                    || source.language.localizedCaseInsensitiveContains(trimmed)
+                    || source.contentType.localizedCaseInsensitiveContains(trimmed)
+                    || source.provider.rawValue.localizedCaseInsensitiveContains(trimmed)
+            }
+            .sorted { lhs, rhs in
+                if lhs.isPinned != rhs.isPinned { return lhs.isPinned }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
+    }
+
     func health(of source: SourceInfo) -> SourceHealth {
         healthBySource[source.id]?.health ?? .untested
     }
@@ -88,6 +112,89 @@ final class SourcesModel {
             errorMessage = userFacingMessage(for: error)
         }
         await refresh()
+    }
+
+    /// Keeps the parser sources for the selected locales and content types
+    /// enabled, and switches the rest off. MangaDex is native and
+    /// language-independent, so it is left to the registry.
+    func applySourceSelection(
+        languages: Set<String>,
+        contentTypes: Set<SourceContentType>
+    ) async {
+        await refresh()
+        guard !languages.isEmpty, !contentTypes.isEmpty else { return }
+
+        let kotatsu = sources.filter { $0.provider == .kotatsuHost }
+        let matching = Set(kotatsu.filter { source in
+            Self.sourceLanguage(source.language, matchesAny: languages)
+                && contentTypes.contains(
+                    SourceContentType.category(for: source.contentType)
+                )
+        }.map(\.id))
+        let others = Set(kotatsu.map(\.id)).subtracting(matching)
+
+        for id in matching {
+            await services.registry.setEnabled(true, id: id)
+        }
+        for id in others {
+            await services.registry.setEnabled(false, id: id)
+        }
+
+        do {
+            try services.sourceStore.setEnabled(true, sourceIds: matching)
+            try services.sourceStore.setEnabled(false, sourceIds: others)
+            errorMessage = nil
+        } catch {
+            errorMessage = userFacingMessage(for: error)
+        }
+
+        await refresh()
+    }
+
+    func setPinned(_ isPinned: Bool, id: String) async {
+        await services.registry.setPinned(isPinned, id: id)
+        do {
+            try services.sourceStore.setPinned(isPinned, sourceId: id)
+            errorMessage = nil
+        } catch {
+            errorMessage = userFacingMessage(for: error)
+        }
+        await refresh()
+    }
+
+    /// Compatibility wrapper for callers that only care about language.
+    func applySourceLanguage(_ language: String) async {
+        await applySourceSelection(
+            languages: [language],
+            contentTypes: Set(SourceContentType.allCases)
+        )
+    }
+
+    static func sourceLanguage(
+        _ source: String,
+        matchesAny languages: Set<String>
+    ) -> Bool {
+        guard !languages.isEmpty else { return false }
+        return languages.contains { sourceLanguage(source, matches: $0) }
+    }
+
+    static func sourceLanguage(_ source: String, matches language: String) -> Bool {
+        let normalizedSource = source.lowercased()
+        let normalizedLanguage = language.lowercased()
+
+        if normalizedSource == "multi"
+            || normalizedLanguage == "multi"
+            || normalizedSource == "all" {
+            return true
+        }
+        if normalizedSource == normalizedLanguage {
+            return true
+        }
+
+        // Locale tags commonly arrive as `pt-BR` or `zh-Hans`; match at the
+        // language level when either side is the shorter tag.
+        return normalizedSource.hasPrefix(normalizedLanguage + "-")
+            || normalizedLanguage.hasPrefix(normalizedSource + "-")
     }
 
     func sourceName(for id: String) -> String {

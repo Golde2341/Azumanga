@@ -10,6 +10,8 @@ final class SourcePreferences {
     var version: String
     var isBuiltIn: Bool
     var isEnabled: Bool
+    /// Pinned sources sort first in the source picker and remain visible there.
+    var isPinned: Bool = false
     /// JSON-encoded `[String: String]` of user-supplied configuration values.
     var configJSON: String
     var installedAt: Date
@@ -26,6 +28,7 @@ final class SourcePreferences {
         version: String,
         isBuiltIn: Bool,
         isEnabled: Bool = true,
+        isPinned: Bool = false,
         config: [String: String] = [:],
         installedAt: Date = Date(),
         updatedAt: Date = Date(),
@@ -38,6 +41,7 @@ final class SourcePreferences {
         self.version = version
         self.isBuiltIn = isBuiltIn
         self.isEnabled = isEnabled
+        self.isPinned = isPinned
         self.configJSON = Self.encode(config: config)
         self.installedAt = installedAt
         self.updatedAt = updatedAt

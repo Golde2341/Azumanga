@@ -78,6 +78,54 @@ struct PersistenceTests {
         #expect(try progress.readChapterIds(sourceId: "org.mangadex", mangaId: "m1") == ["c1"])
     }
 
+    @Test("Batch read state updates multiple chapters and can be undone")
+    func batchProgress() throws {
+        let container = try inMemoryContainer()
+        let progress = ProgressStore(context: container.mainContext)
+        let chapters = [
+            Chapter(sourceId: "org.mangadex", mangaId: "m1", chapterId: "c1", number: 1),
+            Chapter(sourceId: "org.mangadex", mangaId: "m1", chapterId: "c2", number: 2),
+            Chapter(sourceId: "org.mangadex", mangaId: "m1", chapterId: "c3", number: 3),
+        ]
+
+        try progress.markRead(chapters)
+        #expect(
+            try progress.readChapterIds(sourceId: "org.mangadex", mangaId: "m1")
+                == ["c1", "c2", "c3"]
+        )
+
+        try progress.markUnread(chapters)
+        #expect(
+            try progress.readChapterIds(sourceId: "org.mangadex", mangaId: "m1")
+                .isEmpty
+        )
+        let record = try progress.record(
+            sourceId: "org.mangadex",
+            mangaId: "m1",
+            chapterId: "c2"
+        )
+        #expect(record?.status == .unread)
+        #expect(record?.lastPageIndex == 0)
+    }
+
+    @Test("Pinned source state persists across store reads")
+    func pinnedSourceState() throws {
+        let container = try inMemoryContainer()
+        let store = SourceStore(context: container.mainContext)
+        _ = try store.upsert(
+            sourceId: "test.source",
+            name: "Test Source",
+            version: "1.0",
+            isBuiltIn: false
+        )
+
+        try store.setPinned(true, sourceId: "test.source")
+        #expect(try store.pinnedSourceIds() == ["test.source"])
+
+        try store.setPinned(false, sourceId: "test.source")
+        #expect(try store.pinnedSourceIds().isEmpty)
+    }
+
     @Test("Bookmarks toggle on and off and keep their titles")
     func bookmarkToggle() throws {
         let container = try inMemoryContainer()

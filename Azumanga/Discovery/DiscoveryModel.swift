@@ -49,7 +49,21 @@ final class DiscoveryModel {
     }
 
     func refreshSources() async {
-        availableSources = await services.registry.enabledInfos()
+        let enabled = await services.registry.enabledInfos()
+        let pinned = await services.registry.all().filter(\.isPinned)
+
+        var byID: [String: SourceInfo] = [:]
+        for source in enabled {
+            byID[source.id] = source
+        }
+        for source in pinned {
+            byID[source.id] = source
+        }
+        availableSources = byID.values.sorted { lhs, rhs in
+            if lhs.isPinned != rhs.isPinned { return lhs.isPinned }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+
         if selectedSourceId == nil || !availableSources.contains(where: { $0.id == selectedSourceId }) {
             selectedSourceId = availableSources.first?.id
         }

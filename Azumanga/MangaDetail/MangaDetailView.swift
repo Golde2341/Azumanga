@@ -1,3 +1,4 @@
+import AppKit
 import SwiftData
 import SwiftUI
 
@@ -16,6 +17,11 @@ struct MangaDetailView: View {
 
     @State private var model: MangaDetailModel?
     @State private var chapterSortAscending = true
+    @State private var isSelectingChapters = false
+    @State private var selectedChapterIDs: Set<String> = []
+    @State private var lastSelectedChapterID: String?
+    @State private var chapterRowFrames: [String: CGRect] = [:]
+    @State private var marqueeSelectionBase: Set<String>?
 
     init(manga: Manga) {
         self.manga = manga
@@ -73,17 +79,51 @@ struct MangaDetailView: View {
             } else {
                 Section {
                     ForEach(visibleChapters(model)) { chapter in
+                        let isSelected = selectedChapterIDs.contains(chapter.chapterId)
+
                         Button {
-                            openReader(session(for: chapter, model: model))
+                            if isSelectingChapters {
+                                selectChapter(
+                                    chapter,
+                                    model: model,
+                                    extendRange: NSEvent.modifierFlags
+                                        .intersection([.command, .shift])
+                                        .isEmpty == false
+                                )
+                            } else {
+                                openReader(session(for: chapter, model: model))
+                            }
                         } label: {
-                            ChapterRow(
-                                chapter: chapter,
-                                isRead: isRead(chapter),
-                                progress: progress(for: chapter),
-                                downloadState: downloads.state(of: chapter)
-                            )
+                            HStack(spacing: 10) {
+                                if isSelectingChapters {
+                                    Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                                        .font(.title3)
+                                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                                }
+
+                                ChapterRow(
+                                    chapter: chapter,
+                                    isRead: isRead(chapter),
+                                    progress: progress(for: chapter),
+                                    downloadState: downloads.state(of: chapter)
+                                )
+                            }
+                            .contentShape(Rectangle())
+                            .background {
+                                GeometryReader { geometry in
+                                    Color.clear.preference(
+                                        key: ChapterRowFramesKey.self,
+                                        value: [
+                                            chapter.chapterId: geometry.frame(
+                                                in: .named("chapterList")
+                                            )
+                                        ]
+                                    )
+                                }
+                            }
                         }
                         .buttonStyle(.plain)
+                        .listRowBackground(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
                         .contextMenu {
                             Button(isRead(chapter) ? "Mark as Unread" : "Mark as Read") {
                                 model.toggleRead(chapter, isRead: isRead(chapter))
@@ -93,7 +133,7 @@ struct MangaDetailView: View {
                         }
                     }
                 } header: {
-                    HStack {
+                    HStack(spacing: 10) {
                         Text("\(model.chapters.count) Chapters")
                         Spacer()
                         Button {
@@ -107,11 +147,40 @@ struct MangaDetailView: View {
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
+
+                        if isSelectingChapters {
+                            Text("Selecting")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.tint)
+                        } else {
+                            Button {
+                                isSelectingChapters = true
+                                selectedChapterIDs.removeAll()
+                                lastSelectedChapterID = nil
+                                marqueeSelectionBase = nil
+                            } label: {
+                                Label("Select", systemImage: "checklist")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                            .help("Select chapters. Drag across rows, or Shift/Command-click to select a range.")
+                        }
                     }
                 }
             }
         }
         .listStyle(.inset)
+        .coordinateSpace(name: "chapterList")
+        .onPreferenceChange(ChapterRowFramesKey.self) { frames in
+            chapterRowFrames = frames
+        }
+        .simultaneousGesture(marqueeGesture(model))
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if isSelectingChapters {
+                selectionBar(model)
+            }
+        }
         .toolbar { toolbar(model) }
         .alert("Something Went Wrong", isPresented: Binding(
             get: { model.errorMessage != nil },
@@ -149,6 +218,131 @@ struct MangaDetailView: View {
     private func visibleChapters(_ model: MangaDetailModel) -> [Chapter] {
         let ordered = model.ordered(model.chapters)
         return chapterSortAscending ? ordered : ordered.reversed()
+    }
+
+    // MARK: - Batch read state
+
+    private func selectChapter(
+        _ chapter: Chapter,
+        model: MangaDetailModel,
+        extendRange: Bool
+    ) {
+        if extendRange, let anchorID = lastSelectedChapterID {
+            let chapters = visibleChapters(model)
+            if let anchor = chapters.firstIndex(where: { $0.chapterId == anchorID }),
+               let clicked = chapters.firstIndex(where: { $0.chapterId == chapter.chapterId }) {
+                let range = min(anchor, clicked)...max(anchor, clicked)
+                selectedChapterIDs.formUnion(chapters[range].map(\.chapterId))
+                lastSelectedChapterID = chapter.chapterId
+                return
+            }
+        }
+
+        toggleSelection(of: chapter)
+        lastSelectedChapterID = chapter.chapterId
+    }
+
+    private func marqueeGesture(_ model: MangaDetailModel) -> some Gesture {
+        DragGesture(minimumDistance: 5, coordinateSpace: .named("chapterList"))
+            .onChanged { value in
+                guard isSelectingChapters else { return }
+                if marqueeSelectionBase == nil {
+                    marqueeSelectionBase = selectedChapterIDs
+                }
+
+                let chapters = visibleChapters(model)
+                guard let start = chapterIndex(near: value.startLocation.y, in: chapters),
+                      let end = chapterIndex(near: value.location.y, in: chapters)
+                else { return }
+
+                let range = min(start, end)...max(start, end)
+                selectedChapterIDs = (marqueeSelectionBase ?? [])
+                    .union(chapters[range].map(\.chapterId))
+                lastSelectedChapterID = chapters[range.upperBound].chapterId
+            }
+            .onEnded { _ in
+                marqueeSelectionBase = nil
+            }
+    }
+
+    private func chapterIndex(near y: CGFloat, in chapters: [Chapter]) -> Int? {
+        guard let nearest = chapterRowFrames.min(by: {
+            abs($0.value.midY - y) < abs($1.value.midY - y)
+        }) else { return nil }
+        return chapters.firstIndex { $0.chapterId == nearest.key }
+    }
+
+    private func toggleSelection(of chapter: Chapter) {
+        if selectedChapterIDs.contains(chapter.chapterId) {
+            selectedChapterIDs.remove(chapter.chapterId)
+        } else {
+            selectedChapterIDs.insert(chapter.chapterId)
+        }
+    }
+
+    private func selectionBar(_ model: MangaDetailModel) -> some View {
+        HStack(spacing: 10) {
+            Text(selectedChapterIDs.isEmpty
+                 ? "Select chapters"
+                 : "\(selectedChapterIDs.count) selected")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(selectedChapterIDs.isEmpty ? .secondary : .primary)
+
+            Spacer()
+
+            Button("Select All") {
+                selectedChapterIDs = Set(model.chapters.map(\.chapterId))
+                lastSelectedChapterID = nil
+            }
+            .disabled(model.chapters.isEmpty)
+
+            Button("Clear") {
+                selectedChapterIDs.removeAll()
+                lastSelectedChapterID = nil
+            }
+            .disabled(selectedChapterIDs.isEmpty)
+
+            Divider()
+                .frame(height: 20)
+
+            Button("Mark Read") {
+                markSelectedChapters(read: true, model: model)
+            }
+            .buttonStyle(.bordered)
+            .disabled(selectedChapterIDs.isEmpty)
+
+            Button("Mark Unread") {
+                markSelectedChapters(read: false, model: model)
+            }
+            .buttonStyle(.bordered)
+            .disabled(selectedChapterIDs.isEmpty)
+
+            Button("Done") {
+                isSelectingChapters = false
+                selectedChapterIDs.removeAll()
+                lastSelectedChapterID = nil
+                marqueeSelectionBase = nil
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+
+    private func markSelectedChapters(read: Bool, model: MangaDetailModel) {
+        let chapters = model.chapters.filter {
+            selectedChapterIDs.contains($0.chapterId)
+        }
+        guard !chapters.isEmpty else { return }
+        if read {
+            model.markRead(chapters)
+        } else {
+            model.markUnread(chapters)
+        }
+        selectedChapterIDs.removeAll()
+        lastSelectedChapterID = nil
+        marqueeSelectionBase = nil
     }
 
     // MARK: - Downloads
@@ -304,6 +498,19 @@ struct MangaDetailView: View {
             }
             .disabled(model.isLoading)
         }
+    }
+}
+
+/// Chapter rows report their frames in the list's coordinate space so a marquee
+/// drag can turn the rows it crosses into a contiguous selection.
+private struct ChapterRowFramesKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+
+    static func reduce(
+        value: inout [String: CGRect],
+        nextValue: () -> [String: CGRect]
+    ) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
 }
 

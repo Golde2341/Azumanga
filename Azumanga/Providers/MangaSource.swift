@@ -15,6 +15,8 @@ nonisolated protocol MangaSource: Sendable {
     nonisolated var version: String { get }
     /// BCP-47 language tag the source serves by default.
     nonisolated var language: String { get }
+    /// The parser's broad content type, e.g. `MANGA` or `MANHWA`.
+    nonisolated var contentType: String { get }
     /// Behaviours this source supports.
     nonisolated var capabilities: Set<SourceCapability> { get }
     /// `true` for sources compiled into the app, `false` for installed ones.
@@ -33,6 +35,7 @@ nonisolated protocol MangaSource: Sendable {
 
 nonisolated extension MangaSource {
     nonisolated var isBuiltIn: Bool { false }
+    nonisolated var contentType: String { "MANGA" }
 
     /// Default: compiled-in native sources are built-in, everything else is a
     /// user-installed script.

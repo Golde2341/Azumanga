@@ -1,7 +1,12 @@
 package azumanga.host
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.Request
@@ -43,6 +48,16 @@ class ParserHost(
 
     private val parsers = ConcurrentHashMap<String, MangaParser>()
     private val cacheDirectory: File = cacheDir.also { it.mkdirs() }
+    private val healthFilter = MangaListFilter(
+        query = null,
+        states = emptySet(),
+        contentRating = emptySet(),
+        types = emptySet(),
+        demographics = emptySet(),
+        yearFrom = YEAR_UNKNOWN,
+        yearTo = YEAR_UNKNOWN,
+        author = null,
+    )
 
     /**
      * Timeout for the request currently being handled. Requests are serialised on
@@ -53,6 +68,18 @@ class ParserHost(
 
     private val context: MangaLoaderContext = HostLoaderContext(
         parserLookup = { source -> (source as? MangaParserSource)?.let { parser(it) } },
+    )
+
+    /// Health probes use their own clients and parsers so a dead source cannot
+    /// hold a page or chapter request for the normal 45-second read timeout.
+    private val healthParsers = ConcurrentHashMap<String, MangaParser>()
+    private val healthContext: MangaLoaderContext = HostLoaderContext(
+        callTimeoutSeconds = 8,
+        connectTimeoutSeconds = 6,
+        readTimeoutSeconds = 8,
+        parserLookup = { source ->
+            (source as? MangaParserSource)?.let { healthParsers[it.name] }
+        },
     )
 
     fun readyEvent(): String = JSONObject()
@@ -91,6 +118,7 @@ class ParserHost(
             .put("sourceCount", MangaParserSource.entries.size)
 
         "sources" -> sources()
+        "health" -> health(params)
         "list" -> list(params)
         "details" -> details(params)
         "pages" -> pages(params)
@@ -115,6 +143,54 @@ class ParserHost(
             )
         }
         return JSONObject().put("items", items)
+    }
+
+    /// Checks several sources concurrently. The ordinary request loop is serial, so
+    /// a batch endpoint is what keeps "check selected sources" from taking one
+    /// timeout per dead site.
+    private fun health(params: JSONObject): JSONObject = runBlocking {
+        val keysJson = params.optJSONArray("sources") ?: JSONArray()
+        val keys = (0 until keysJson.length()).mapNotNull { index ->
+            keysJson.optString(index).takeIf { it.isNotEmpty() }
+        }
+        val perSourceTimeout = params.optLong("timeoutMs", 8_000L)
+            .coerceIn(1_000L, 60_000L)
+        val gate = Semaphore(24)
+        val results = coroutineScope {
+            keys.map { key ->
+                async(Dispatchers.IO) {
+                    gate.withPermit { checkSource(key, perSourceTimeout) }
+                }
+            }.awaitAll()
+        }
+        JSONObject().put("items", JSONArray(results))
+    }
+
+    private suspend fun checkSource(key: String, timeoutMs: Long): JSONObject = try {
+        val source = MangaParserSource.entries.firstOrNull { it.name == key }
+            ?: throw IllegalArgumentException("Unknown source: $key")
+        val parser = healthParser(source)
+        val order = parser.availableSortOrders.firstOrNull() ?: SortOrder.UPDATED
+        val mangas = withTimeout(timeoutMs) {
+            parser.getList(0, order, healthFilter)
+        }
+        if (mangas.isEmpty()) {
+            JSONObject()
+                .put("key", key)
+                .put("ok", false)
+                .put("detail", "The source returned no results.")
+        } else {
+            JSONObject()
+                .put("key", key)
+                .put("ok", true)
+                .put("count", mangas.size)
+                .put("detail", "${mangas.size} results")
+        }
+    } catch (error: Throwable) {
+        JSONObject()
+            .put("key", key)
+            .put("ok", false)
+            .put("detail", error.message ?: error.javaClass.simpleName)
     }
 
     private fun list(params: JSONObject): JSONObject {
@@ -254,6 +330,9 @@ class ParserHost(
 
     private fun parser(source: MangaParserSource): MangaParser =
         parsers.computeIfAbsent(source.name) { context.newParserInstance(source) }
+
+    private fun healthParser(source: MangaParserSource): MangaParser =
+        healthParsers.computeIfAbsent(source.name) { healthContext.newParserInstance(source) }
 
     private fun <T> call(block: suspend () -> T): T = runBlocking {
         withTimeout(requestTimeoutMs) { block() }

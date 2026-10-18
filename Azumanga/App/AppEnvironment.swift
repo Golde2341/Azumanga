@@ -14,6 +14,7 @@ final class AppEnvironment {
     let sources: SourcesModel
     let downloads: DownloadsModel
     let healthChecker: SourceHealthChecker
+    @ObservationIgnored private var bootstrapTask: Task<Void, Never>?
 
     init(container: ModelContainer = PersistenceContainer.shared) {
         let settings = SettingsStore()
@@ -39,8 +40,37 @@ final class AppEnvironment {
     /// Registers sources and restores the user's enablement. Safe to call more
     /// than once; the registry upserts by identifier.
     func bootstrap() async {
-        await services.bootstrapSources(using: settings)
-        await sources.refresh()
+        if let bootstrapTask {
+            await bootstrapTask.value
+            return
+        }
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await services.bootstrapSources(using: settings)
+            await sources.refresh()
+        }
+        bootstrapTask = task
+        await task.value
+    }
+
+    /// Applies the welcome choices to the native MangaDex source and to the
+    /// parser-host sources. MangaDex uses the first selected language; parser
+    /// sources must match both a selected language and a selected content type.
+    func applyWelcomeSelection(
+        languages: [String],
+        contentTypes: Set<SourceContentType>
+    ) async {
+        await bootstrap()
+        guard let primaryLanguage = languages.first else { return }
+
+        settings.language = primaryLanguage.lowercased()
+        await services.refreshSources(using: settings)
+        await sources.applySourceSelection(
+            languages: Set(languages),
+            contentTypes: contentTypes
+        )
+        await discovery.refreshSources()
     }
 
     /// Rebuilds provider instances after a settings change they depend on.

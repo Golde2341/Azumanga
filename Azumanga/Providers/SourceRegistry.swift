@@ -6,10 +6,12 @@ nonisolated struct SourceInfo: Identifiable, Sendable, Hashable {
     let name: String
     let version: String
     let language: String
+    let contentType: String
     let isBuiltIn: Bool
     let provider: SourceProviderKind
     let capabilities: Set<SourceCapability>
     var isEnabled: Bool
+    var isPinned: Bool
 }
 
 /// Holds the live source instances. Views and models depend on this registry,
@@ -18,6 +20,7 @@ nonisolated struct SourceInfo: Identifiable, Sendable, Hashable {
 actor SourceRegistry {
     private var sources: [String: any MangaSource] = [:]
     private var enabled: Set<String> = []
+    private var pinned: Set<String> = []
     private var insertionOrder: [String] = []
 
     init() {}
@@ -45,6 +48,7 @@ actor SourceRegistry {
     func unregister(id: String) -> Bool {
         guard sources.removeValue(forKey: id) != nil else { return false }
         enabled.remove(id)
+        pinned.remove(id)
         insertionOrder.removeAll { $0 == id }
         return true
     }
@@ -63,6 +67,18 @@ actor SourceRegistry {
 
     func isEnabled(id: String) -> Bool {
         enabled.contains(id)
+    }
+
+    func setPinned(_ isPinned: Bool, id: String) {
+        if isPinned {
+            pinned.insert(id)
+        } else {
+            pinned.remove(id)
+        }
+    }
+
+    func isPinned(id: String) -> Bool {
+        pinned.contains(id)
     }
 
     func all() -> [SourceInfo] {
@@ -92,10 +108,12 @@ actor SourceRegistry {
             name: source.name,
             version: source.version,
             language: source.language,
+            contentType: source.contentType,
             isBuiltIn: source.isBuiltIn,
             provider: source.providerKind,
             capabilities: source.capabilities,
-            isEnabled: enabled.contains(source.id)
+            isEnabled: enabled.contains(source.id),
+            isPinned: pinned.contains(source.id)
         )
     }
 }

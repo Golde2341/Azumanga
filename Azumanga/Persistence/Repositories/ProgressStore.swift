@@ -82,11 +82,62 @@ final class ProgressStore {
     }
 
     func markRead(_ chapter: Chapter) throws {
-        try setStatus(.completed, sourceId: chapter.sourceId, mangaId: chapter.mangaId, chapterId: chapter.chapterId, chapterNumber: chapter.number, chapterTitle: chapter.title)
+        try markRead([chapter])
+    }
+
+    func markRead(_ chapters: [Chapter]) throws {
+        guard !chapters.isEmpty else { return }
+        for chapter in chapters {
+            let record = try record(
+                sourceId: chapter.sourceId,
+                mangaId: chapter.mangaId,
+                chapterId: chapter.chapterId
+            ) ?? {
+                let new = ReadingProgressRecord(
+                    sourceId: chapter.sourceId,
+                    mangaId: chapter.mangaId,
+                    chapterId: chapter.chapterId,
+                    chapterNumber: chapter.number,
+                    chapterTitle: chapter.title
+                )
+                context.insert(new)
+                return new
+            }()
+            record.chapterNumber = chapter.number ?? record.chapterNumber
+            record.chapterTitle = chapter.title ?? record.chapterTitle
+            record.status = .completed
+            record.updatedAt = Date()
+        }
+        try save()
     }
 
     func markUnread(_ chapter: Chapter) throws {
-        try setStatus(.unread, sourceId: chapter.sourceId, mangaId: chapter.mangaId, chapterId: chapter.chapterId)
+        try markUnread([chapter])
+    }
+
+    func markUnread(_ chapters: [Chapter]) throws {
+        guard !chapters.isEmpty else { return }
+        for chapter in chapters {
+            let record = try record(
+                sourceId: chapter.sourceId,
+                mangaId: chapter.mangaId,
+                chapterId: chapter.chapterId
+            ) ?? {
+                let new = ReadingProgressRecord(
+                    sourceId: chapter.sourceId,
+                    mangaId: chapter.mangaId,
+                    chapterId: chapter.chapterId,
+                    chapterNumber: chapter.number,
+                    chapterTitle: chapter.title
+                )
+                context.insert(new)
+                return new
+            }()
+            record.status = .unread
+            record.lastPageIndex = 0
+            record.updatedAt = Date()
+        }
+        try save()
     }
 
     /// Chapter ids that have been fully read, for a single manga.

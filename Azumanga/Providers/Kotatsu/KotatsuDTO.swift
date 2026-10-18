@@ -67,6 +67,23 @@ nonisolated struct KotatsuSourceListDTO: Decodable, Sendable {
     var items: [KotatsuSourceDTO]
 }
 
+/// One batch health-check request. The host checks these sources concurrently.
+nonisolated struct KotatsuHealthRequest: Encodable, Sendable {
+    var sources: [String]
+    var timeoutMs: Int
+}
+
+nonisolated struct KotatsuHealthResponse: Decodable, Sendable {
+    var items: [Item]
+
+    nonisolated struct Item: Decodable, Sendable {
+        var key: String
+        var ok: Bool
+        var detail: String?
+        var count: Int?
+    }
+}
+
 nonisolated struct KotatsuFilterOptionsDTO: Decodable, Sendable {
     var sortOrders: [String]
     var capabilities: Capabilities

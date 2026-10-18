@@ -90,8 +90,16 @@ final class MangaDetailModel {
         try? services.progressStore.markRead(chapter)
     }
 
+    func markRead(_ chapters: [Chapter]) {
+        try? services.progressStore.markRead(chapters)
+    }
+
     func markUnread(_ chapter: Chapter) {
         try? services.progressStore.markUnread(chapter)
+    }
+
+    func markUnread(_ chapters: [Chapter]) {
+        try? services.progressStore.markUnread(chapters)
     }
 
     func toggleRead(_ chapter: Chapter, isRead: Bool) {

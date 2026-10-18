@@ -31,8 +31,18 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
 struct RootView: View {
     @Environment(AppEnvironment.self) private var app
 
+    @AppStorage("hasCompletedWelcome") private var hasCompletedWelcome = false
     @State private var selection: SidebarItem? = .library
     @State private var libraryPath = NavigationPath()
+
+    private var welcomeBinding: Binding<Bool> {
+        Binding(
+            get: { !hasCompletedWelcome },
+            set: { presented in
+                if !presented { hasCompletedWelcome = true }
+            }
+        )
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -58,6 +68,12 @@ struct RootView: View {
                     description: Text("Choose a section from the sidebar.")
                 )
             }
+        }
+        .sheet(isPresented: welcomeBinding) {
+            WelcomeView {
+                hasCompletedWelcome = true
+            }
+            .environment(app)
         }
         .task {
             await app.bootstrap()
