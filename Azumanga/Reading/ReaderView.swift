@@ -162,7 +162,6 @@ struct ReaderView: View {
     /// Whether the corner grip is driving the window size. The controls must stay
     /// visible while it is.
     @State private var isResizingWindow = false
-    @State private var scrubFraction: CGFloat = 0
     /// A page's width over its height, once one of them has loaded and can be measured.
     @State private var pageAspect: CGFloat?
     /// The same proportion, but fixed for the vertical reader's layout. Every page
@@ -241,6 +240,12 @@ struct ReaderView: View {
         .onChange(of: controlsVisible) { _, _ in
             guard let window else { return }
             reconcileWindow(window)
+        }
+        .onChange(of: showsDisplayOptions) { _, isPresented in
+            if !isPresented { revealControls() }
+        }
+        .onChange(of: showChapterPicker) { _, isPresented in
+            if !isPresented { revealControls() }
         }
         .onHover { isInside in
             // Only the pointer arriving counts. Movement inside the reader deliberately
@@ -1894,192 +1899,131 @@ struct ReaderView: View {
         VStack {
             Spacer()
             if !model.pages.isEmpty {
-                HStack(spacing: 12) {
-                    Button {
-                        goToAdjacentChapter(-1)
-                    } label: {
-                        Image(systemName: "backward.end.fill")
-                    }
-                    .disabled(!model.hasPreviousChapter)
-                    .buttonStyle(.plain)
+                GlassEffectContainer(spacing: 10) {
+                    HStack(spacing: 10) {
+                        pageStepButton(
+                            direction: -1,
+                            systemImage: "chevron.left",
+                            isDisabled: !canGoToPreviousPage
+                        )
 
-                    VStack(spacing: 4) {
-                        Text("\(scrubPage + 1) / \(model.pages.count)")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                        VStack(spacing: 4) {
+                            Text("\(model.currentIndex + 1) / \(model.pages.count)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
 
-                        progressBar
-                    }
-                    .frame(width: 260)
+                            pageSlider
+                        }
+                        .frame(width: 260)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .glassEffect(.regular, in: Capsule())
 
-                    Button {
-                        goToAdjacentChapter(1)
-                    } label: {
-                        Image(systemName: "forward.end.fill")
+                        pageStepButton(
+                            direction: 1,
+                            systemImage: "chevron.right",
+                            isDisabled: !canGoToNextPage
+                        )
                     }
-                    .disabled(!model.hasNextChapter)
-                    .buttonStyle(.plain)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(.ultraThinMaterial, in: Capsule())
+                // Match the top control bar's floating backdrop shadow.
+                .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 6)
                 .padding(.bottom, 16)
             }
         }
         .allowsHitTesting(!model.pages.isEmpty)
-        .onAppear { syncScrubberToCurrentPage() }
-        .onChange(of: model.currentIndex) { _, _ in syncScrubberToCurrentPage() }
-        .onChange(of: model.pages.count) { _, _ in syncScrubberToCurrentPage() }
     }
 
-    /// Keeps the invisible slider's thumb on the page being read, so grabbing the
-    /// scrubbing track starts from where the reader actually is.
-    private func syncScrubberToCurrentPage() {
-        guard !isScrubbing else { return }
-        scrubFraction = ReaderScrubbing.fraction(
-            ofPage: model.currentIndex,
-            pageCount: model.pages.count
-        )
+    private func pageStepButton(
+        direction: Int,
+        systemImage: String,
+        isDisabled: Bool
+    ) -> some View {
+        Button {
+            revealControls()
+            turnSpread(direction)
+        } label: {
+            Image(systemName: systemImage)
+                .frame(width: 30, height: 30)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .glassEffect(.regular, in: Circle())
+        .help(direction < 0 ? "Previous page" : "Next page")
     }
 
-    /// The page the bar is reporting: the one a drag has reached, or the one being read.
-    private var scrubPage: Int {
-        guard isScrubbing else { return model.currentIndex }
-        return ReaderScrubbing.page(atFraction: scrubFraction, pageCount: model.pages.count)
+    private var canGoToPreviousPage: Bool {
+        guard !model.pages.isEmpty else { return false }
+        guard viewOptions.layout == .horizontal else {
+            return model.currentIndex > 0 || model.hasPreviousChapter
+        }
+        let step = viewOptions.direction == .rightToLeft ? 1 : -1
+        return canTurnHorizontalSpread(by: step)
     }
 
-    /// Progress through the chapter as discrete page steps. The whole bar is the
-    /// gesture surface: a click jumps to the nearest step, and a drag moves the reader
-    /// through pages as it crosses them.
-    private var progressBar: some View {
-        GeometryReader { geometry in
-            let width = geometry.size.width
-            let pageCount = model.pages.count
-            let current = scrubPage
-            let fraction = ReaderScrubbing.fraction(ofPage: current, pageCount: pageCount)
+    private var canGoToNextPage: Bool {
+        guard !model.pages.isEmpty else { return false }
+        guard viewOptions.layout == .horizontal else {
+            return model.currentIndex + 1 < model.pages.count || model.hasNextChapter
+        }
+        let step = viewOptions.direction == .rightToLeft ? -1 : 1
+        return canTurnHorizontalSpread(by: step)
+    }
 
-            Canvas { context, size in
-                let trackHeight: CGFloat = 4
-                let centerY = size.height / 2
-                let trackRect = CGRect(
-                    x: 0,
-                    y: centerY - trackHeight / 2,
-                    width: size.width,
-                    height: trackHeight
-                )
-                context.fill(
-                    Path(roundedRect: trackRect, cornerRadius: trackHeight / 2),
-                    with: .color(Color.secondary.opacity(0.22))
-                )
+    private func canTurnHorizontalSpread(by step: Int) -> Bool {
+        let items = horizontalItems
+        guard let start = items.firstIndex(where: { $0.id == spreadPosition })
+            ?? items.firstIndex(where: { $0.id == currentHorizontalItemID })
+        else { return false }
 
-                if fraction > 0 {
-                    let fillRect = CGRect(
-                        x: 0,
-                        y: trackRect.minY,
-                        width: size.width * fraction,
-                        height: trackHeight
-                    )
-                    context.fill(
-                        Path(roundedRect: fillRect, cornerRadius: trackHeight / 2),
-                        with: .color(.accentColor)
+        var index = start + step
+        while items.indices.contains(index) {
+            if !items[index].isBreak { return true }
+            index += step
+        }
+        return step > 0 ? model.hasNextChapter : model.hasPreviousChapter
+    }
+
+    /// The native stepped slider is the page slider: its ticks are the step marks,
+    /// and dragging the thumb moves through pages as it crosses each step.
+    private var pageSlider: some View {
+        Slider(
+            value: Binding(
+                get: { Double(model.currentIndex) },
+                set: { value in
+                    let page = Int(value.rounded())
+                    guard page != model.currentIndex else { return }
+                    model.goToPage(
+                        page,
+                        save: false,
+                        resetZoom: false,
+                        prefetch: false
                     )
                 }
-
-                if pageCount > 1 {
-                    // A tick per page on short chapters, and a readable sample on very
-                    // long ones. The filled knob still quantizes to exact page steps.
-                    let maximumTicks = 100
-                    let tickStride = max(
-                        1,
-                        Int(ceil(Double(pageCount) / Double(maximumTicks)))
-                    )
-                    for index in stride(from: 0, to: pageCount, by: tickStride) {
-                        let x = size.width * CGFloat(index) / CGFloat(pageCount - 1)
-                        let isFilled = index <= current
-                        let tickHeight: CGFloat = index == current ? 10 : 7
-                        let tickRect = CGRect(
-                            x: x - 0.5,
-                            y: centerY - tickHeight / 2,
-                            width: 1,
-                            height: tickHeight
-                        )
-                        context.fill(
-                            Path(tickRect),
-                            with: .color(
-                                isFilled
-                                    ? Color.white.opacity(0.5)
-                                    : Color.secondary.opacity(0.38)
-                            )
-                        )
-                    }
+            ),
+            in: 0...Double(max(model.pages.count - 1, 1)),
+            step: 1,
+            label: { Text("Page") },
+            onEditingChanged: { editing in
+                isScrubbing = editing
+                if editing {
+                    // A scrub is a deliberate page jump, not a scroll gesture.
+                    verticalScrollTracker.isUserScrolling = false
+                    verticalScrollTracker.isHorizontalScrolling = false
+                    verticalScrollTracker.isApplyingModelChange = false
+                    revealControls()
+                } else {
+                    model.prefetchAroundCurrentPage()
+                    model.flushProgress()
+                    revealControls()
                 }
-
-                let knobDiameter: CGFloat = 10
-                let knobX = min(
-                    max(knobDiameter / 2, size.width * fraction),
-                    max(knobDiameter / 2, size.width - knobDiameter / 2)
-                )
-                context.fill(
-                    Path(ellipseIn: CGRect(
-                        x: knobX - knobDiameter / 2,
-                        y: centerY - knobDiameter / 2,
-                        width: knobDiameter,
-                        height: knobDiameter
-                    )),
-                    with: .color(.accentColor)
-                )
             }
-            .contentShape(Rectangle())
-            .gesture(scrubGesture(width: width))
-        }
-        .frame(height: 22)
-        .help("Click or drag to jump through pages")
-    }
-
-    private func scrubGesture(width: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { value in
-                updateScrub(atX: value.location.x, width: width, isFinal: false)
-            }
-            .onEnded { value in
-                updateScrub(atX: value.location.x, width: width, isFinal: true)
-            }
-    }
-
-    private func updateScrub(atX x: CGFloat, width: CGFloat, isFinal: Bool) {
-        guard width > 0, !model.pages.isEmpty else { return }
-
-        let fraction = min(max(0, x / width), 1)
-        if !isScrubbing {
-            isScrubbing = true
-            // A scrub is a deliberate page jump, not a scroll gesture. Clear any
-            // flags left by a swipe so the model's page change is allowed to move the
-            // reader immediately.
-            verticalScrollTracker.isUserScrolling = false
-            verticalScrollTracker.isHorizontalScrolling = false
-            verticalScrollTracker.isApplyingModelChange = false
-            revealControls()
-        }
-        scrubFraction = fraction
-
-        let target = ReaderScrubbing.page(
-            atFraction: fraction,
-            pageCount: model.pages.count
         )
-        if target != model.currentIndex {
-            model.goToPage(target, save: false, resetZoom: false, prefetch: false)
-        }
-
-        if isFinal {
-            model.prefetchAroundCurrentPage()
-            model.flushProgress()
-            scrubFraction = ReaderScrubbing.fraction(
-                ofPage: model.currentIndex,
-                pageCount: model.pages.count
-            )
-            isScrubbing = false
-            revealControls()
-        }
+        .labelsHidden()
+        .accessibilityLabel("Page")
+        .disabled(model.pages.count < 2)
+        .simultaneousGesture(TapGesture().onEnded { revealControls() })
     }
 
     // MARK: - Controls
@@ -2183,14 +2127,16 @@ struct ReaderView: View {
     @ViewBuilder
     private var chapterControls: some View {
         Button {
+            revealControls()
             goToAdjacentChapter(-1)
         } label: {
-            Label("Previous Chapter", systemImage: "chevron.left")
+            Label("Previous Chapter", systemImage: "backward.end.fill")
         }
         .disabled(!model.hasPreviousChapter)
         .help("Previous chapter")
 
         Button {
+            revealControls()
             showChapterPicker = true
         } label: {
             Label("Chapters", systemImage: "list.bullet")
@@ -2198,9 +2144,10 @@ struct ReaderView: View {
         .help("Chapters")
 
         Button {
+            revealControls()
             goToAdjacentChapter(1)
         } label: {
-            Label("Next Chapter", systemImage: "chevron.right")
+            Label("Next Chapter", systemImage: "forward.end.fill")
         }
         .disabled(!model.hasNextChapter)
         .help("Next chapter")
@@ -2227,6 +2174,7 @@ struct ReaderView: View {
 
     private var bookmarkControl: some View {
         Button {
+            revealControls()
             model.toggleBookmark()
         } label: {
             Label(
@@ -2240,6 +2188,7 @@ struct ReaderView: View {
 
     private var displayControl: some View {
         Button {
+            revealControls()
             showsDisplayOptions = true
         } label: {
             Label("Display", systemImage: "slider.horizontal.3")
@@ -2262,6 +2211,7 @@ struct ReaderView: View {
         let isFullScreen = isReaderFullScreen || isNativeFullScreen
 
         return Button {
+            revealControls()
             toggleFullScreen()
         } label: {
             Label(
