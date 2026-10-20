@@ -495,15 +495,7 @@ struct ReaderView: View {
                       !isFullScreenAnimating
                 else { continue }
 
-                resizeSettleTask?.cancel()
-                resizeAnchor = captureZoomAnchor(zoom: model.zoom)
-                resizePinTask?.cancel()
-                resizePinTask = Task { @MainActor in
-                    while !Task.isCancelled {
-                        applyResizeAnchor()
-                        try? await Task.sleep(for: .milliseconds(8))
-                    }
-                }
+                beginWindowFramePositionPin()
             }
         }
         .task(id: window) {
@@ -514,15 +506,7 @@ struct ReaderView: View {
             ) {
                 guard resizeAnchor != nil else { continue }
                 // Keep pinning through the last layout pass, then settle and release.
-                resizeSettleTask?.cancel()
-                resizeSettleTask = Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(180))
-                    guard !Task.isCancelled else { return }
-                    applyResizeAnchor()
-                    resizePinTask?.cancel()
-                    resizePinTask = nil
-                    resizeAnchor = nil
-                }
+                finishWindowFramePositionPin()
             }
         }
         // A level above the menu bar is app-wide z-order, not just this space. Drop it
@@ -582,6 +566,60 @@ struct ReaderView: View {
         pageSyncSuppressedUntil = Date().addingTimeInterval(interval)
     }
 
+    /// Keeps the vertical stream's reading spot fixed while a window-frame change
+    /// rewrites every page's height. The live-resize path and the reader's own
+    /// full-screen animation both use this: page heights scale with the window
+    /// width, so leaving the scroll offset untouched would slide the viewport by a
+    /// page or two even though the user did not scroll.
+    private func beginWindowFramePositionPin() {
+        guard viewOptions.layout == .vertical,
+              let anchor = captureZoomAnchor(zoom: model.zoom)
+        else { return }
+
+        resizeSettleTask?.cancel()
+        resizeSettleTask = nil
+        resizeAnchor = anchor
+        resizePinTask?.cancel()
+        resizePinTask = Task { @MainActor in
+            while !Task.isCancelled {
+                applyResizeAnchor()
+                try? await Task.sleep(for: .milliseconds(8))
+            }
+        }
+    }
+
+    /// Keeps pinning through the last layout pass, then releases the scroll view.
+    private func finishWindowFramePositionPin() {
+        guard resizeAnchor != nil else { return }
+        resizeSettleTask?.cancel()
+        resizeSettleTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            applyResizeAnchor()
+            resizePinTask?.cancel()
+            resizePinTask = nil
+            resizeAnchor = nil
+        }
+    }
+
+    /// Settles the model trackers after a full-screen frame change. Horizontal paging
+    /// re-centres the scroll position on the spread the model has open; vertical
+    /// tracking is reset to the current page so the resize is never mistaken for a
+    /// scroll gesture.
+    private func settleFullScreenPosition() {
+        if viewOptions.layout == .vertical {
+            verticalScrollTracker.applyTask?.cancel()
+            verticalScrollTracker.applyTask = nil
+            if let id = currentVerticalPageID {
+                verticalScrollTracker.topPageID = id
+                verticalScrollTracker.lastAppliedPageID = id
+            }
+        } else {
+            syncHorizontalPosition(animated: false)
+        }
+        finishWindowFramePositionPin()
+    }
+
     /// Marks AppKit's native full screen transition as in flight. Window chrome is left
     /// alone until the matching `did…` notification has unwound.
     private func beginNativeFullScreenTransition() {
@@ -604,6 +642,10 @@ struct ReaderView: View {
         else { return }
 
         suppressPageSync(for: 0.8)
+        beginWindowFramePositionPin()
+        if viewOptions.layout == .horizontal {
+            syncHorizontalPosition(animated: false)
+        }
         isFullScreenAnimating = true
         fullScreenState.generation &+= 1
         let generation = fullScreenState.generation
@@ -652,6 +694,7 @@ struct ReaderView: View {
             }
             isFullScreenAnimating = false
             reconcileWindow(window)
+            settleFullScreenPosition()
         }
     }
 
@@ -659,6 +702,10 @@ struct ReaderView: View {
     private func exitReaderFullScreen(_ window: NSWindow) {
         guard isReaderFullScreen, !isFullScreenAnimating else { return }
         suppressPageSync(for: 0.8)
+        beginWindowFramePositionPin()
+        if viewOptions.layout == .horizontal {
+            syncHorizontalPosition(animated: false)
+        }
         isFullScreenAnimating = true
         fullScreenState.generation &+= 1
         let generation = fullScreenState.generation
@@ -696,7 +743,7 @@ struct ReaderView: View {
             self.windowedFrame = nil
             updateWindowResizeLock()
             reconcileWindow(window)
-            syncHorizontalPosition(animated: false)
+            settleFullScreenPosition()
         }
     }
 
@@ -721,6 +768,13 @@ struct ReaderView: View {
         isFullScreenAnimating = false
         isReaderFullScreen = false
         settings.readerFullscreen = false
+
+        // Native full screen owns the frame now; stop pinning the old one.
+        resizePinTask?.cancel()
+        resizePinTask = nil
+        resizeSettleTask?.cancel()
+        resizeSettleTask = nil
+        resizeAnchor = nil
 
         if NSApp.isActive {
             NSApp.presentationOptions = savedPresentationOptions
@@ -1071,6 +1125,8 @@ struct ReaderView: View {
               !isZoomSettling,
               !isScrubbing,
               !verticalScrollTracker.isRestoring,
+              !isFullScreenAnimating,
+              !isPageSyncSuppressed,
               !tops.isEmpty
         else { return }
 
@@ -1105,6 +1161,8 @@ struct ReaderView: View {
               !isMagnifying,
               !isZoomSettling,
               !isScrubbing,
+              !isFullScreenAnimating,
+              !isPageSyncSuppressed,
               let id = verticalScrollTracker.topPageID,
               let section = sections.first(where: { $0.chapterId == id.chapterId }),
               let pagePosition = section.pages.firstIndex(where: { $0.index == id.pageIndex }),

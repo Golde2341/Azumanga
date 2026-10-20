@@ -13,10 +13,10 @@ struct BrowseView: View {
         @Bindable var model = model
 
         Group {
-            if model.isLoading && model.results.isEmpty {
+            if model.isLoading && visibleResults.isEmpty {
                 ProgressView("Loading…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let errorMessage = model.errorMessage, model.results.isEmpty {
+            } else if let errorMessage = model.errorMessage, visibleResults.isEmpty {
                 ContentUnavailableView {
                     Label("Couldn't Load", systemImage: "wifi.exclamationmark")
                 } description: {
@@ -27,16 +27,16 @@ struct BrowseView: View {
                     }
                     .buttonStyle(.borderedProminent)
                 }
-            } else if model.results.isEmpty {
+            } else if visibleResults.isEmpty {
                 ContentUnavailableView(
                     "No Results",
                     systemImage: "magnifyingglass",
-                    description: Text(searchText.isEmpty ? "Nothing to show for this source yet." : "No manga matched “\(searchText)”.")
+                    description: Text(noResultsDescription)
                 )
             } else {
                 ScrollView {
                     MangaGrid(
-                        items: model.results,
+                        items: visibleResults,
                         favoriteIds: favoriteIds,
                         progressLabel: { _ in nil },
                         isLoadingMore: model.isLoadingMore,
@@ -79,6 +79,20 @@ struct BrowseView: View {
 
     private var favoriteIds: Set<String> {
         Set(library.entries.filter(\.isFavorite).map(\.key))
+    }
+
+    private var visibleResults: [Manga] {
+        guard settings.hideNSFWResults else { return model.results }
+        return model.results.filter { !$0.isNSFW }
+    }
+
+    private var noResultsDescription: String {
+        if settings.hideNSFWResults {
+            return "No non-NSFW results. You can change this in Settings → Sources."
+        }
+        return searchText.isEmpty
+            ? "Nothing to show for this source yet."
+            : "No manga matched “\(searchText)”."
     }
 
     @ToolbarContentBuilder

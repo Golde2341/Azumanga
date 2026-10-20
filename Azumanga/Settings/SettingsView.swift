@@ -8,9 +8,6 @@ struct SettingsView: View {
             ReadingSettingsView()
                 .tabItem { Label("Reading", systemImage: "book") }
 
-            AppearanceSettingsView()
-                .tabItem { Label("Appearance", systemImage: "paintpalette") }
-
             SourcesSettingsView()
                 .tabItem { Label("Sources", systemImage: "square.stack.3d.up") }
 
@@ -123,6 +120,14 @@ private struct ReadingSettingsView: View {
                 Toggle("Keep the first page alone in double-page mode", isOn: $settings.doublePageFirstPageAlone)
             }
 
+            Section("Default Reader Background") {
+                BackgroundSwatches(selection: $settings.background)
+
+                Text("Used for manga without a custom view. Each manga can choose its own background in the reader’s Per Manga View Options.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Performance") {
                 Stepper("Prefetch \(settings.prefetchDistance) page\(settings.prefetchDistance == 1 ? "" : "s") ahead", value: $settings.prefetchDistance, in: 0...10)
             }
@@ -131,43 +136,12 @@ private struct ReadingSettingsView: View {
                 Toggle("Download smaller (data saver) images", isOn: $settings.prefersDataSaver)
                 TextField("Translated language", text: $settings.language)
                     .onSubmit { Task { await app.refreshProviders() } }
-                Picker("Content", selection: Binding(
-                    get: { settings.contentRatings.contains(.pornographic) ? "all" : "safe" },
-                    set: { newValue in
-                        settings.contentRatings = newValue == "all"
-                            ? Set(ContentRating.allCases)
-                            : ContentRating.safeDefaults
-                        Task { await app.refreshProviders() }
-                    }
-                )) {
-                    Text("Safe and suggestive").tag("safe")
-                    Text("Include adult content").tag("all")
-                }
             }
         }
         .formStyle(.grouped)
         .onChange(of: settings.prefersDataSaver) { _, _ in
             Task { await app.refreshProviders() }
         }
-    }
-}
-
-private struct AppearanceSettingsView: View {
-    @Environment(SettingsStore.self) private var settings
-
-    var body: some View {
-        @Bindable var settings = settings
-
-        Form {
-            Section("Default Reader Background") {
-                BackgroundSwatches(selection: $settings.background)
-
-                Text("Used for manga without a custom view. Each manga can choose its own background in the reader’s Per Manga View Options.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .formStyle(.grouped)
     }
 }
 

@@ -3,6 +3,7 @@ import SwiftUI
 /// Global search across every enabled source plus pinned sources.
 struct GlobalSearchView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(SettingsStore.self) private var settings
     @State private var model: GlobalSearchModel
     @State private var query = ""
     @State private var path = NavigationPath()
@@ -102,32 +103,50 @@ struct GlobalSearchView: View {
                 description: Text("Find manga from all enabled sources, plus pinned sources even when they are disabled.")
             )
             .frame(maxHeight: .infinity)
-        } else if model.isSearching && model.rows.isEmpty {
+        } else if model.isSearching && visibleRows.isEmpty {
             ProgressView("Searching sources…")
                 .frame(maxHeight: .infinity)
-        } else if let error = model.errorMessage, model.rows.isEmpty {
+        } else if let error = model.errorMessage, visibleRows.isEmpty {
             ContentUnavailableView(
                 "Search Unavailable",
                 systemImage: "exclamationmark.triangle",
                 description: Text(error)
             )
             .frame(maxHeight: .infinity)
-        } else if model.rows.isEmpty && model.hasSearched {
+        } else if visibleRows.isEmpty && model.hasSearched {
             ContentUnavailableView(
                 "No Results",
                 systemImage: "magnifyingglass",
-                description: Text("No source returned manga for “\(query)”.")
+                description: Text(
+                    settings.hideNSFWResults
+                        ? "No non-NSFW manga matched “\(query)”."
+                        : "No source returned manga for “\(query)”."
+                )
             )
             .frame(maxHeight: .infinity)
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 22) {
-                    ForEach(model.rows) { row in
+                    ForEach(visibleRows) { row in
                         sourceRow(row)
                     }
                 }
                 .padding(18)
             }
+        }
+    }
+
+    private var visibleRows: [GlobalSearchModel.SourceRow] {
+        guard settings.hideNSFWResults else { return model.rows }
+        return model.rows.compactMap { row in
+            if row.error != nil {
+                return row
+            }
+            let results = row.results.filter { !$0.isNSFW }
+            guard !results.isEmpty else { return nil }
+            var filtered = row
+            filtered.results = results
+            return filtered
         }
     }
 

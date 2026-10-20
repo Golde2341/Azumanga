@@ -20,6 +20,7 @@ nonisolated struct Manga: Identifiable, Hashable, Sendable, Codable {
     var webURL: URL?
 
     var id: String { "\(sourceId):\(mangaId)" }
+    var isNSFW: Bool { contentRating.isNSFW }
 
     init(
         sourceId: String,

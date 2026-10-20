@@ -71,4 +71,9 @@ nonisolated enum ContentRating: String, Codable, Sendable, Hashable, CaseIterabl
 
     /// Ratings considered acceptable for the default (non-adult) browsing experience.
     static var safeDefaults: Set<ContentRating> { [.safe, .suggestive] }
+
+    /// Whether this rating denotes explicitly adult material.
+    var isNSFW: Bool {
+        self == .erotica || self == .pornographic
+    }
 }

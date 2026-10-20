@@ -98,6 +98,7 @@ struct RootView: View {
         }
         .sheet(isPresented: $showingGlobalSearch) {
             GlobalSearchView(services: app.services)
+                .environment(app.settings)
         }
         .task {
             await app.bootstrap()

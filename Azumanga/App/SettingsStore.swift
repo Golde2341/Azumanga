@@ -51,6 +51,13 @@ final class SettingsStore {
         didSet { defaults.set(contentRatings.map(\.rawValue).sorted(), forKey: Key.contentRatings.rawValue) }
     }
 
+    /// Hides erotica and pornographic manga from source listings and search results.
+    /// Turning it off includes every rating, matching the old adult-content picker.
+    var hideNSFWResults: Bool {
+        get { !contentRatings.contains(where: \.isNSFW) }
+        set { contentRatings = newValue ? ContentRating.safeDefaults : Set(ContentRating.allCases) }
+    }
+
     var language: String {
         didSet { defaults.set(language, forKey: Key.language.rawValue) }
     }

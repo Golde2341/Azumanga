@@ -5,6 +5,8 @@ import UniformTypeIdentifiers
 struct SourcesSettingsView: View {
     @Environment(SourcesModel.self) private var model
     @Environment(SourceHealthChecker.self) private var checker
+    @Environment(SettingsStore.self) private var settings
+    @Environment(AppEnvironment.self) private var app
 
     @State private var showingFileImporter = false
     @State private var showingURLSheet = false
@@ -12,6 +14,8 @@ struct SourcesSettingsView: View {
     @State private var manifestURLText = ""
 
     var body: some View {
+        @Bindable var settings = settings
+
         Form {
             Section {
                 Text("Providers are scripts that run in a restricted JavaScript sandbox. They can only reach the hosts their manifest declares.")
@@ -29,6 +33,13 @@ struct SourcesSettingsView: View {
                 } label: {
                     Label("See Sources…", systemImage: "list.bullet.rectangle")
                 }
+            }
+
+            Section("Content") {
+                Toggle("Hide NSFW results", isOn: $settings.hideNSFWResults)
+                Text("Erotica and pornographic titles are hidden from Browse and Global Search. This also limits MangaDex to safe and suggestive titles.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             parserSection
@@ -82,6 +93,9 @@ struct SourcesSettingsView: View {
         .formStyle(.grouped)
         .task {
             await model.refresh()
+        }
+        .onChange(of: settings.hideNSFWResults) { _, _ in
+            Task { await app.refreshProviders() }
         }
         .fileImporter(
             isPresented: $showingFileImporter,

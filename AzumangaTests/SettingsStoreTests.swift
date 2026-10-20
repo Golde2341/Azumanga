@@ -56,4 +56,20 @@ struct SettingsStoreTests {
         settings.contentRatings = []
         #expect(settings.mangaDexConfiguration.contentRatings == ContentRating.safeDefaults)
     }
+
+    @Test("Hiding NSFW results uses the safe rating set")
+    func hideNSFWResults() {
+        let settings = SettingsStore(defaults: makeDefaults())
+        #expect(settings.hideNSFWResults)
+
+        settings.hideNSFWResults = false
+        #expect(!settings.hideNSFWResults)
+        #expect(settings.contentRatings == Set(ContentRating.allCases))
+        #expect(settings.contentRatings.contains(.erotica))
+        #expect(settings.contentRatings.contains(.pornographic))
+
+        settings.hideNSFWResults = true
+        #expect(settings.hideNSFWResults)
+        #expect(settings.contentRatings == ContentRating.safeDefaults)
+    }
 }

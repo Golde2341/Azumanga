@@ -1,21 +1,24 @@
 {
   "fill" : {
-    "solid" : "display-p3:0.83545,0.28247,0.15295,1.00000"
+    "linear-gradient" : [
+      "display-p3:0.93045,0.31996,0.17697,1.00000",
+      "display-p3:0.83545,0.28247,0.15295,1.00000"
+    ]
   },
   "groups" : [
     {
       "layers" : [
         {
           "blend-mode" : "normal",
-          "glass" : false,
+          "glass" : true,
           "hidden" : false,
           "image-name" : "asasas.svg",
           "name" : "asasas",
           "position" : {
-            "scale" : 2.21,
+            "scale" : 2.34,
             "translation-in-points" : [
-              0,
-              0
+              7.627509150704839,
+              0.4567978855037609
             ]
           }
         }
