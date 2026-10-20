@@ -55,4 +55,22 @@ extension PageBackground {
         case .white: .white
         }
     }
+
+    /// The reader's background with the same warm white point as the pages.
+    func color(warmedBy warmth: Double) -> Color {
+        let tint = ReaderWarmth.components(for: warmth)
+        switch self {
+        case .black:
+            return .black
+        case .darkGray:
+            return Color(
+                .sRGB,
+                red: 0.12 * tint.red,
+                green: 0.12 * tint.green,
+                blue: 0.12 * tint.blue
+            )
+        case .white:
+            return Color(.sRGB, red: tint.red, green: tint.green, blue: tint.blue)
+        }
+    }
 }

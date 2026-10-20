@@ -21,6 +21,8 @@ struct PerMangaViewOptionsPopover: View {
                 Divider()
                 backgroundOptions
                 Divider()
+                warmthOptions
+                Divider()
                 sessionActions
                 Divider()
                 chapterActions
@@ -158,6 +160,31 @@ struct PerMangaViewOptionsPopover: View {
                 .font(.subheadline.weight(.semibold))
 
             BackgroundSwatches(selection: $options.background)
+        }
+    }
+
+    private var warmthOptions: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Warmth")
+                    .font(.subheadline.weight(.semibold))
+
+                Spacer(minLength: 0)
+
+                Text(options.warmth > 0.001 ? "\(Int((options.warmth * 100).rounded()))%" : "Off")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            Slider(value: $options.warmth, in: 0...1) {
+                Text("Warmth")
+            }
+            .labelsHidden()
+            .accessibilityValue(
+                options.warmth > 0.001
+                    ? "\(Int((options.warmth * 100).rounded())) percent"
+                    : "Off"
+            )
         }
     }
 

@@ -50,6 +50,15 @@ final class ReaderViewOptions {
         set { update { $0.background = newValue } }
     }
 
+    /// A warm page tint. `0` leaves pages untouched; `1` maps white to `#f1e1c9`.
+    var warmth: Double {
+        get { customOptions?.warmth ?? 0 }
+        set {
+            let clamped = min(max(newValue, 0), 1)
+            update { $0.warmth = clamped }
+        }
+    }
+
     func resetToDefaults() {
         customOptions = nil
         store.remove(for: mangaKey)

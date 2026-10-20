@@ -83,6 +83,58 @@ struct MangaViewOptionsTests {
         #expect(reopened.layout == .horizontal)
     }
 
+    @Test("Warmth is saved with the manga and clamped to its range")
+    func warmthPersists() {
+        let defaults = makeDefaults()
+        let settings = makeSettings(defaults)
+        let store = MangaViewOptionsStore(defaults: defaults)
+        let manga = makeManga()
+        let options = ReaderViewOptions(manga: manga, defaults: settings, store: store)
+
+        options.warmth = 0.65
+
+        let reopened = ReaderViewOptions(
+            manga: manga,
+            defaults: settings,
+            store: MangaViewOptionsStore(defaults: defaults)
+        )
+        #expect(reopened.usesCustomOptions)
+        #expect(abs(reopened.warmth - 0.65) < 0.000_001)
+
+        options.warmth = 2
+        #expect(options.warmth == 1)
+
+        options.warmth = -1
+        #expect(options.warmth == 0)
+    }
+
+    @Test("Views saved before warmth existed decode as unmodified")
+    func legacyWarmthDefaultsToOff() throws {
+        let json = """
+        {
+          "layout": "vertical",
+          "direction": "leftToRight",
+          "pageMode": "single",
+          "fitMode": "fitScreen",
+          "background": "white"
+        }
+        """
+
+        let options = try JSONDecoder().decode(
+            MangaViewOptions.self,
+            from: Data(json.utf8)
+        )
+
+        #expect(options.warmth == 0)
+        #expect(options.background == .white)
+
+        let roundTrip = try JSONDecoder().decode(
+            MangaViewOptions.self,
+            from: JSONEncoder().encode(options)
+        )
+        #expect(roundTrip == options)
+    }
+
     @Test("Reset removes the override and follows defaults again")
     func reset() {
         let defaults = makeDefaults()

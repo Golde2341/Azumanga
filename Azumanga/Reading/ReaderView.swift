@@ -191,7 +191,7 @@ struct ReaderView: View {
 
     var body: some View {
         ZStack {
-            viewOptions.background.color
+            viewOptions.background.color(warmedBy: viewOptions.warmth)
                 .ignoresSafeArea()
 
             content
@@ -1037,7 +1037,12 @@ struct ReaderView: View {
         switch item {
         case let .page(chapterId, page):
             let id = ReaderPageID(chapterId: chapterId, pageIndex: page.index)
-            AsyncPageImage(page: page, maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
+            AsyncPageImage(
+                page: page,
+                maxPixelSize: model.renderMaxPixelSize,
+                contentMode: .fit,
+                warmth: viewOptions.warmth
+            )
                 .frame(width: pageWidth, height: pageHeight)
                 .id(id)
                 .background {
@@ -1691,13 +1696,23 @@ struct ReaderView: View {
     @ViewBuilder
     private func spreadView(_ pages: [Page], size: CGSize) -> some View {
         if pages.count == 1 {
-            AsyncPageImage(page: pages[0], maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
+            AsyncPageImage(
+                page: pages[0],
+                maxPixelSize: model.renderMaxPixelSize,
+                contentMode: .fit,
+                warmth: viewOptions.warmth
+            )
                 .frame(width: size.width, height: size.height)
         } else {
             GeometryReader { inner in
                 HStack(spacing: 0) {
                     ForEach(pages) { page in
-                        AsyncPageImage(page: page, maxPixelSize: model.renderMaxPixelSize, contentMode: .fit)
+                        AsyncPageImage(
+                            page: page,
+                            maxPixelSize: model.renderMaxPixelSize,
+                            contentMode: .fit,
+                            warmth: viewOptions.warmth
+                        )
                             .frame(width: inner.size.width / CGFloat(pages.count))
                     }
                 }

@@ -1,6 +1,37 @@
 import CoreGraphics
 import SwiftUI
 
+/// The page tint used by the reader's warmth control.
+enum ReaderWarmth {
+    /// White is multiplied by this color at maximum warmth.
+    static let maximumColor = Color(
+        .sRGB,
+        red: 241.0 / 255.0,
+        green: 225.0 / 255.0,
+        blue: 201.0 / 255.0
+    )
+
+    /// Interpolates from an identity multiplier to `maximumColor`.
+    static func multiplier(for amount: Double) -> Color {
+        let value = min(max(amount, 0), 1)
+        return Color(
+            .sRGB,
+            red: 1 + (241.0 / 255.0 - 1) * value,
+            green: 1 + (225.0 / 255.0 - 1) * value,
+            blue: 1 + (201.0 / 255.0 - 1) * value
+        )
+    }
+
+    static func components(for amount: Double) -> (red: Double, green: Double, blue: Double) {
+        let value = min(max(amount, 0), 1)
+        return (
+            1 + (241.0 / 255.0 - 1) * value,
+            1 + (225.0 / 255.0 - 1) * value,
+            1 + (201.0 / 255.0 - 1) * value
+        )
+    }
+}
+
 /// Loads and displays a cover image from an arbitrary URL using the shared
 /// image pipeline. Never blocks layout: shows a placeholder until decoded.
 struct CoverImage: View {
@@ -65,6 +96,8 @@ struct AsyncPageImage: View {
     let page: Page
     var maxPixelSize: Int
     var contentMode: ContentMode = .fit
+    /// Page tint from 0 (unchanged) to 1 (`#f1e1c9` white point).
+    var warmth: Double = 0
 
     @Environment(\.imagePipeline) private var pipeline
     @State private var image: CGImage?
@@ -76,6 +109,7 @@ struct AsyncPageImage: View {
                 Image(decorative: image, scale: 1)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
+                    .colorMultiply(ReaderWarmth.multiplier(for: warmth))
             } else if let failureMessage {
                 VStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle")
