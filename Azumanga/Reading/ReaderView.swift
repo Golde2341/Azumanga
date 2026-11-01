@@ -179,6 +179,8 @@ struct ReaderView: View {
     /// reserves a slot of this shape before its image arrives, so an image finishing
     /// its load can never reflow the stack and move the viewport.
     @State private var verticalPageAspect: CGFloat?
+    /// Decides `verticalPageAspect` once, from several pages.
+    @State private var verticalShapeTask: Task<Void, Never>?
     /// The stable page proportion for this episode, decided once from a sample and
     /// then kept for every spread in it.
     @State private var episodePageAspect: CGFloat?
@@ -289,10 +291,12 @@ struct ReaderView: View {
             scheduleIntroIfNeeded()
             syncSectionsFromModel()
             beginEpisodeShapeSampling(force: true)
+            beginVerticalShapeSampling()
         }
         .onChange(of: model.pages) { _, _ in
             syncSectionsFromModel()
             beginEpisodeShapeSampling()
+            beginVerticalShapeSampling()
         }
         .onChange(of: model.chapter.chapterId) { _, _ in
             beginEpisodeShapeSampling(force: true)
@@ -411,6 +415,7 @@ struct ReaderView: View {
                 applyWindowShape()
                 updateWindowResizeLock()
                 syncSectionsFromModel()
+                beginVerticalShapeSampling()
                 // The vertical scroll view is new; open it where the reader is.
                 if let id = currentVerticalPageID {
                     verticalScrollTracker.topPageID = id
@@ -585,6 +590,7 @@ struct ReaderView: View {
             }
             windowResizeDelegate.detach()
             episodeShapeTask?.cancel()
+            verticalShapeTask?.cancel()
             verticalScrollTracker.applyTask?.cancel()
             horizontalScrollPinTask?.cancel()
             // The restore that would have released this is gone; do not leave the
@@ -973,16 +979,11 @@ struct ReaderView: View {
 
         let size = model.renderMaxPixelSize
         Task {
-            // The first page is loaded for the reveal, so this is the earliest point
-            // at which the chapter's proportions can be known. Fixing them here means
-            // the vertical stack is already shaped correctly when the pages arrive.
-            if let image = try? await images.image(for: firstPage, maxPixelSize: size),
-               image.height > 0 {
-                let aspect = CGFloat(image.width) / CGFloat(image.height)
-                if verticalPageAspect == nil {
-                    verticalPageAspect = aspect
-                }
-            }
+            // Wait for the first page so the cover does not zoom away onto a
+            // placeholder. The stack's slot shape is decided separately, by a median
+            // over several pages: a first page that is a wide double-page spread must
+            // not be allowed to shape every page in the chapter.
+            _ = try? await images.image(for: firstPage, maxPixelSize: size)
             finishIntro()
         }
         Task {
@@ -1106,7 +1107,6 @@ struct ReaderView: View {
             // height — the reflow that used to shove the scroll view into the previous
             // page is gone.
             let reservedAspect = min(max(verticalPageAspect ?? Self.typicalPageAspectRatio, 0.2), 5)
-            let pageHeight = (pageWidth * zoom) / reservedAspect
 
             ScrollViewReader { proxy in
                 ScrollView([.vertical, .horizontal]) {
@@ -1117,8 +1117,8 @@ struct ReaderView: View {
                         ForEach(verticalItems) { item in
                             verticalItemView(
                                 item,
-                                pageWidth: pageWidth * zoom,
-                                pageHeight: pageHeight
+                                width: pageWidth * zoom,
+                                reservedAspect: reservedAspect
                             )
                         }
                     }
@@ -1213,32 +1213,20 @@ struct ReaderView: View {
     @ViewBuilder
     private func verticalItemView(
         _ item: ReaderVerticalItem,
-        pageWidth: CGFloat,
-        pageHeight: CGFloat
+        width: CGFloat,
+        reservedAspect: CGFloat
     ) -> some View {
         switch item {
         case let .page(chapterId, page):
-            let id = ReaderPageID(chapterId: chapterId, pageIndex: page.index)
-            AsyncPageImage(
+            ReaderPageRow(
                 page: page,
+                id: ReaderPageID(chapterId: chapterId, pageIndex: page.index),
                 maxPixelSize: model.renderMaxPixelSize,
-                contentMode: .fit,
-                warmth: viewOptions.warmth
+                warmth: viewOptions.warmth,
+                width: width,
+                reservedAspect: reservedAspect,
+                tracker: verticalScrollTracker
             )
-                .frame(width: pageWidth, height: pageHeight)
-                .id(id)
-                .background {
-                    GeometryReader { pageGeometry in
-                        Color.clear.preference(
-                            key: ReaderVerticalPageTopsKey.self,
-                            value: [
-                                id: pageGeometry
-                                    .frame(in: .named("verticalReader"))
-                                    .minY
-                            ]
-                        )
-                    }
-                }
         case let .chapterBreak(chapterId):
             if let section = sections.first(where: { $0.chapterId == chapterId }) {
                 chapterBreak(after: section)
@@ -1998,9 +1986,32 @@ struct ReaderView: View {
             }
     }
 
-    private func capturedPageHeight(zoom: CGFloat, width: CGFloat) -> CGFloat {
-        let aspect = min(max(verticalPageAspect ?? Self.typicalPageAspectRatio, 0.2), 5)
+    /// One page's height at a given zoom and width.
+    ///
+    /// A page takes its own shape once it has decoded — that is what lets a wide
+    /// spread occupy less room than a normal page instead of sitting in a full-height
+    /// slot. Pages that have not been measured yet use the sampled shape.
+    private func pageHeight(_ id: ReaderPageID, zoom: CGFloat, width: CGFloat) -> CGFloat {
+        let aspect = min(
+            max(
+                verticalScrollTracker.pageAspects[id]
+                    ?? verticalPageAspect
+                    ?? Self.typicalPageAspectRatio,
+                0.05
+            ),
+            20
+        )
         return (width * zoom) / aspect
+    }
+
+    private func pagesHeight(_ section: ReaderSection, zoom: CGFloat, width: CGFloat) -> CGFloat {
+        section.pages.reduce(0) { total, page in
+            total + pageHeight(
+                ReaderPageID(chapterId: section.chapterId, pageIndex: page.index),
+                zoom: zoom,
+                width: width
+            )
+        }
     }
 
     /// Finds the page or chapter break crossing the viewport's top edge, and how far
@@ -2009,29 +2020,31 @@ struct ReaderView: View {
         guard let scrollView = verticalScrollView, !sections.isEmpty else { return nil }
 
         let clip = scrollView.contentView
-        let pageHeight = capturedPageHeight(zoom: zoom, width: clip.bounds.width)
-        guard pageHeight > 0 else { return nil }
-
+        let width = clip.bounds.width
         let breakHeight = Self.verticalChapterBreakHeight
         var remaining = max(0, clip.bounds.origin.y)
 
         for section in sections {
-            let pagesHeight = pageHeight * CGFloat(section.pages.count)
-            if remaining < pagesHeight {
-                let rawIndex = Int(remaining / pageHeight)
-                let index = min(max(rawIndex, 0), max(section.pages.count - 1, 0))
-                guard section.pages.indices.contains(index) else { return nil }
-                let top = CGFloat(index) * pageHeight
-                return ReaderZoomAnchor(
-                    position: .page(
-                        chapterId: section.chapterId,
-                        pageIndex: section.pages[index].index,
-                        fraction: (remaining - top) / pageHeight
-                    ),
-                    zoom: zoom
+            for page in section.pages {
+                let height = pageHeight(
+                    ReaderPageID(chapterId: section.chapterId, pageIndex: page.index),
+                    zoom: zoom,
+                    width: width
                 )
+                guard height > 0 else { continue }
+
+                if remaining < height {
+                    return ReaderZoomAnchor(
+                        position: .page(
+                            chapterId: section.chapterId,
+                            pageIndex: page.index,
+                            fraction: remaining / height
+                        ),
+                        zoom: zoom
+                    )
+                }
+                remaining -= height
             }
-            remaining -= pagesHeight
 
             if remaining < breakHeight {
                 return ReaderZoomAnchor(
@@ -2055,9 +2068,6 @@ struct ReaderView: View {
         zoom: CGFloat,
         width: CGFloat
     ) -> CGFloat? {
-        let pageHeight = capturedPageHeight(zoom: zoom, width: width)
-        guard pageHeight > 0 else { return nil }
-
         let breakHeight = Self.verticalChapterBreakHeight
         var offset: CGFloat = 0
 
@@ -2065,18 +2075,30 @@ struct ReaderView: View {
             switch anchor.position {
             case let .page(chapterId, pageIndex, fraction):
                 if section.chapterId == chapterId {
-                    guard let index = section.pages.firstIndex(where: { $0.index == pageIndex }) else {
-                        return offset
+                    var above: CGFloat = 0
+                    for page in section.pages {
+                        let height = pageHeight(
+                            ReaderPageID(chapterId: section.chapterId, pageIndex: page.index),
+                            zoom: zoom,
+                            width: width
+                        )
+                        if page.index == pageIndex {
+                            return offset + above + fraction * height
+                        }
+                        above += height
                     }
-                    return offset + CGFloat(index) * pageHeight + fraction * pageHeight
+                    return offset + above
                 }
+
             case let .chapterBreak(chapterId, fraction):
                 if section.chapterId == chapterId {
-                    return offset + CGFloat(section.pages.count) * pageHeight + fraction * breakHeight
+                    return offset
+                        + pagesHeight(section, zoom: zoom, width: width)
+                        + fraction * breakHeight
                 }
             }
 
-            offset += CGFloat(section.pages.count) * pageHeight + breakHeight
+            offset += pagesHeight(section, zoom: zoom, width: width) + breakHeight
         }
 
         return nil
@@ -2654,13 +2676,10 @@ struct ReaderView: View {
             guard let image = await images.cachedImage(for: page.url, maxPixelSize: maxPixelSize),
                   image.height > 0
             else { continue }
-            let aspect = CGFloat(image.width) / CGFloat(image.height)
-            pageAspect = aspect
-            // The vertical stack's slot shape is chosen once and then kept. Letting it
-            // follow the current page would resize every page in the chapter mid-read.
-            if verticalPageAspect == nil {
-                verticalPageAspect = aspect
-            }
+            // Only the horizontal window shape follows the current page. The vertical
+            // stack's slot shape is decided once, from a median of several pages; see
+            // `beginVerticalShapeSampling`.
+            pageAspect = CGFloat(image.width) / CGFloat(image.height)
             return
         }
         pageAspect = nil
@@ -2747,6 +2766,107 @@ struct ReaderView: View {
             reconcileWindow(window, resizingWindowShape: true)
         }
         updateWindowResizeLock()
+    }
+
+    /// Chooses the vertical stack's slot shape once, from the median of several
+    /// pages rather than from the first one.
+    ///
+    /// A chapter's first page is often a wide double-page spread — normal in printed
+    /// manga, and common in a PDF. Letting that page decide the slot makes every
+    /// ordinary portrait page tiny inside a wide, short slot. The median ignores an
+    /// outlier or two, and the result is still fixed once so pages never resize while
+    /// the reader scrolls.
+    private func beginVerticalShapeSampling() {
+        guard viewOptions.layout == .vertical,
+              verticalPageAspect == nil,
+              !model.pages.isEmpty
+        else { return }
+
+        verticalShapeTask?.cancel()
+        verticalShapeTask = Task { @MainActor in
+            await sampleVerticalPageAspect()
+        }
+    }
+
+    private func sampleVerticalPageAspect() async {
+        var samples: [Int: CGFloat] = [:]
+
+        for _ in 0..<20 {
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled,
+                  verticalPageAspect == nil,
+                  viewOptions.layout == .vertical
+            else { return }
+
+            let pages = model.pages
+            guard !pages.isEmpty else { continue }
+
+            for index in episodeSampleIndices(count: pages.count, current: model.currentIndex, limit: 5)
+            where samples[index] == nil {
+                guard let image = await images.cachedImage(
+                    for: pages[index].url,
+                    maxPixelSize: model.renderMaxPixelSize
+                ), image.height > 0 else { continue }
+                samples[index] = CGFloat(image.width) / CGFloat(image.height)
+            }
+
+            if samples.count >= min(3, pages.count) {
+                break
+            }
+        }
+
+        guard !Task.isCancelled,
+              verticalPageAspect == nil,
+              viewOptions.layout == .vertical
+        else { return }
+
+        // Only the page on screen is decoded at open, which on its own is a single
+        // sample — and if that page is a wide spread, the "median" is the spread.
+        // Load a couple of neighbours to get a real sample: they are local files, or
+        // pages the reader has already prefetched, so this is cheap and bounded.
+        let pages = model.pages
+        if samples.count < min(3, pages.count) {
+            for index in episodeSampleIndices(
+                count: pages.count,
+                current: model.currentIndex,
+                limit: 3
+            ) where samples[index] == nil {
+                guard let image = try? await images.image(
+                    for: pages[index],
+                    maxPixelSize: model.renderMaxPixelSize
+                ), image.height > 0 else { continue }
+
+                samples[index] = CGFloat(image.width) / CGFloat(image.height)
+                if samples.count >= min(3, pages.count) { break }
+            }
+        }
+
+        guard !Task.isCancelled, verticalPageAspect == nil else { return }
+
+        // A wide spread must not shape the whole stack: ignore landscape samples
+        // whenever a portrait page was measured, and never trust a lone sample.
+        let measured = Array(samples.values)
+        let portrait = measured.filter { $0 < 1 }
+        let pool = portrait.isEmpty ? measured : portrait
+
+        if pool.count >= 2, let median = Self.median(pool) {
+            verticalPageAspect = median
+        } else if let only = pool.first, only < 1 {
+            verticalPageAspect = only
+        } else {
+            verticalPageAspect = Self.typicalPageAspectRatio
+        }
+
+        // Seed the per-page table so the anchoring maths knows these shapes before
+        // the pages themselves have been displayed.
+        let chapterId = model.chapter.chapterId
+        for (index, aspect) in samples where pages.indices.contains(index) {
+            verticalScrollTracker.pageAspects[
+                ReaderPageID(chapterId: chapterId, pageIndex: pages[index].index)
+            ] = aspect
+        }
+
+        verticalShapeTask = nil
     }
 
     /// Up to `limit` distinct pages around the current one. Keeping the sample near
@@ -3205,10 +3325,82 @@ private struct ReaderResizeGrip: NSViewRepresentable {
     }
 }
 
+/// One page in the vertical stream.
+///
+/// The row starts at the sampled page shape and takes the page's own shape as soon
+/// as it has decoded, so a wide spread shrinks into its own space instead of leaving
+/// a slot-sized gap behind it. The measured shape is recorded on the tracker,
+/// because the zoom and resize anchoring maths has to add up each page's real height.
+private struct ReaderPageRow: View {
+    let page: Page
+    let id: ReaderPageID
+    let maxPixelSize: Int
+    let warmth: Double
+    let width: CGFloat
+    let reservedAspect: CGFloat
+    let tracker: ReaderVerticalScrollTracker
+
+    @State private var aspect: CGFloat?
+
+    init(
+        page: Page,
+        id: ReaderPageID,
+        maxPixelSize: Int,
+        warmth: Double,
+        width: CGFloat,
+        reservedAspect: CGFloat,
+        tracker: ReaderVerticalScrollTracker
+    ) {
+        self.page = page
+        self.id = id
+        self.maxPixelSize = maxPixelSize
+        self.warmth = warmth
+        self.width = width
+        self.reservedAspect = reservedAspect
+        self.tracker = tracker
+        // A page measured earlier in this session starts at its real shape, so
+        // scrolling back to it does not re-measure and reflow the stream.
+        _aspect = State(initialValue: tracker.pageAspects[id])
+    }
+
+    var body: some View {
+        let resolved = min(max(aspect ?? reservedAspect, 0.05), 20)
+        let height = width / resolved
+
+        AsyncPageImage(
+            page: page,
+            maxPixelSize: maxPixelSize,
+            contentMode: .fit,
+            warmth: warmth,
+            onAspect: { decoded in
+                tracker.pageAspects[id] = decoded
+                if aspect == nil { aspect = decoded }
+            }
+        )
+        .frame(width: width, height: height)
+        .id(id)
+        .background {
+            GeometryReader { pageGeometry in
+                Color.clear.preference(
+                    key: ReaderVerticalPageTopsKey.self,
+                    value: [
+                        id: pageGeometry
+                            .frame(in: .named("verticalReader"))
+                            .minY,
+                    ]
+                )
+            }
+        }
+    }
+}
+
 /// Vertical reader page tracking that does not invalidate the view when it changes.
 private final class ReaderVerticalScrollTracker {
     var topPageID: ReaderPageID?
     var lastAppliedPageID: ReaderPageID?
+    /// Shape of every page that has decoded, so the stream can be measured page by
+    /// page for zoom and resize anchoring.
+    var pageAspects: [ReaderPageID: CGFloat] = [:]
     var isUserScrolling = false
     /// True while the horizontal pager is tracking the user's fingers.
     var isHorizontalScrolling = false

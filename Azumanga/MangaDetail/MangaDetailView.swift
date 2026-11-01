@@ -22,6 +22,7 @@ struct MangaDetailView: View {
     @State private var lastSelectedChapterID: String?
     @State private var chapterRowFrames: [String: CGRect] = [:]
     @State private var marqueeSelectionBase: Set<String>?
+    @State private var showingEditDetails = false
 
     init(manga: Manga) {
         self.manga = manga
@@ -50,6 +51,15 @@ struct MangaDetailView: View {
                 model?.recordOpened()
             }
             await model?.load()
+        }
+        .sheet(isPresented: $showingEditDetails) {
+            ImportMangaSheet(services: services, library: library, editingMangaId: manga.mangaId)
+        }
+        .onChange(of: showingEditDetails) { _, isPresented in
+            guard !isPresented else { return }
+            // The edit changed the metadata on disk; pick it back up.
+            library.reload()
+            Task { await model?.load() }
         }
     }
 
@@ -476,6 +486,14 @@ struct MangaDetailView: View {
                             Label("Favourite", systemImage: entry.isFavorite ? "heart.fill" : "heart")
                         }
                         .tint(entry.isFavorite ? .pink : nil)
+                    }
+
+                    if manga.sourceId == LocalLibrarySource.sourceId {
+                        Button {
+                            showingEditDetails = true
+                        } label: {
+                            Label("Edit Details", systemImage: "pencil")
+                        }
                     }
 
                     if let webURL = model.details.webURL {

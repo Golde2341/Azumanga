@@ -6,6 +6,7 @@ import SwiftUI
 struct LibraryView: View {
     @Binding var path: NavigationPath
     @Environment(LibraryModel.self) private var library
+    @Environment(Services.self) private var services
     @Environment(\.openWindow) private var openWindow
 
     @State private var filter: Filter = .all
@@ -13,6 +14,9 @@ struct LibraryView: View {
     @State private var layout: Layout = .grid
     @State private var newCategoryName = ""
     @State private var showingNewCategory = false
+    @State private var showingImport = false
+    @State private var showingEditDetails = false
+    @State private var editingMangaId: String?
 
     enum Filter: String, CaseIterable, Identifiable {
         case all
@@ -70,6 +74,12 @@ struct LibraryView: View {
         }
         .sheet(isPresented: $showingNewCategory) {
             newCategorySheet
+        }
+        .sheet(isPresented: $showingImport) {
+            ImportMangaSheet(services: services, library: library)
+        }
+        .sheet(isPresented: $showingEditDetails) {
+            ImportMangaSheet(services: services, library: library, editingMangaId: editingMangaId)
         }
         .task {
             library.reload()
@@ -282,6 +292,13 @@ struct LibraryView: View {
                 }
             }
         }
+        if entry.sourceId == LocalLibrarySource.sourceId {
+            Divider()
+            Button("Edit Details…") {
+                editingMangaId = entry.mangaId
+                showingEditDetails = true
+            }
+        }
         Divider()
         Button("Remove from Library", role: .destructive) {
             library.remove(entry)
@@ -292,8 +309,12 @@ struct LibraryView: View {
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .principal) {
             Picker("Filter", selection: $filter) {
+                // `Text` rather than `Label`: a toolbar renders a `Label` in its
+                // icon-only presentation, which left this pill showing a bare shelf
+                // glyph with no text. The Category and Sort pills beside it use
+                // `Text` for the same reason.
                 ForEach(Filter.allCases) { filter in
-                    Label(filter.displayName, systemImage: filter.systemImage).tag(filter)
+                    Text(filter.displayName).tag(filter)
                 }
             }
             .frame(minWidth: 170)
@@ -337,6 +358,15 @@ struct LibraryView: View {
             } label: {
                 Label("New Category", systemImage: "folder.badge.plus")
             }
+        }
+
+        ToolbarItem(placement: .automatic) {
+            Button {
+                showingImport = true
+            } label: {
+                Label("Add Manga", systemImage: "plus")
+            }
+            .help("Add a manga from local CBZ files")
         }
     }
 

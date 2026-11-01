@@ -98,6 +98,9 @@ struct AsyncPageImage: View {
     var contentMode: ContentMode = .fit
     /// Page tint from 0 (unchanged) to 1 (`#f1e1c9` white point).
     var warmth: Double = 0
+    /// Reports the decoded page's width over height. The reader sizes each page to
+    /// its own shape, so it needs to know it.
+    var onAspect: ((CGFloat) -> Void)?
 
     @Environment(\.imagePipeline) private var pipeline
     @State private var image: CGImage?
@@ -130,17 +133,24 @@ struct AsyncPageImage: View {
         }
     }
 
+    private func report(_ image: CGImage) {
+        guard image.height > 0, let onAspect else { return }
+        onAspect(CGFloat(image.width) / CGFloat(image.height))
+    }
+
     private func load() async {
         image = nil
         failureMessage = nil
         if let cached = await pipeline.cachedImage(for: page.url, maxPixelSize: maxPixelSize) {
             image = cached
+            report(cached)
             return
         }
         do {
             let loaded = try await pipeline.image(for: page, maxPixelSize: maxPixelSize)
             try Task.checkCancellation()
             image = loaded
+            report(loaded)
         } catch is CancellationError {
             // Cancelled because the page scrolled away.
         } catch {

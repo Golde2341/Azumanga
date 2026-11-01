@@ -30,10 +30,15 @@ final class Services {
     let sourceStore: SourceStore
     let downloadStore: DownloadStore
 
+    /// Where imported CBZ manga live on disk. Shared by the import sheet and the
+    /// local source that serves them.
+    let localLibrary: LocalLibraryStore
+
     init(
         container: ModelContainer = PersistenceContainer.shared,
         http: HTTPClient = HTTPClient(),
         downloadDirectories: DownloadDirectories = DownloadDirectories(),
+        localLibrary: LocalLibraryStore = LocalLibraryStore(),
         kotatsuConfiguration: KotatsuHostConfiguration? = KotatsuHostLocator.resolve()
     ) {
         let registry = SourceRegistry()
@@ -60,6 +65,7 @@ final class Services {
         self.bookmarkStore = BookmarkStore(context: container.mainContext)
         self.sourceStore = sourceStore
         self.downloadStore = DownloadStore(context: container.mainContext)
+        self.localLibrary = localLibrary
         self.installer = SourceInstallService(registry: registry, http: http, sourceStore: sourceStore)
         self.downloads = DownloadManager(
             registry: registry,
@@ -96,6 +102,12 @@ final class Services {
                 isEnabled: await registry.isEnabled(id: source.id)
             )
         }
+
+        // Imported local manga are served by a source, but they are not a discovery
+        // provider: registering it disabled keeps it resolvable by id (all the detail
+        // and reader paths need) while leaving Browse and Global Search untouched. It
+        // is deliberately not written to `sourceStore`, so it stays out of Settings.
+        await registry.register(LocalLibrarySource(store: localLibrary), isEnabled: false)
 
         await installer.loadInstalledSources()
         await registerKotatsuSources()
