@@ -70,6 +70,20 @@ nonisolated enum ReaderPaging {
 /// invalidate the view and must not be copied at the moment it is needed.
 nonisolated final class ReaderScrollOffset: @unchecked Sendable {
     var value: CGFloat = 0
+    /// While true the paging behavior leaves the scroll target where the layout put
+    /// it.
+    ///
+    /// A full-screen frame change rewrites the spread width on every frame of the
+    /// animation, and the offset is moving with it. Rounding the position to the
+    /// nearest spread against a width that is itself changing rounds onto a
+    /// neighbour, which shows as the row scrolling toward the next page and snapping
+    /// back for the length of the animation. Nothing is gestured while the window
+    /// animates, so there is nothing for the behavior to settle.
+    ///
+    /// This lives on the shared object rather than on the behavior struct because the
+    /// struct is captured when the view body is evaluated, which races the animation;
+    /// a value read here is always current.
+    var isSuppressed = false
 }
 
 /// Applies `ReaderPaging` to the reader's horizontal scroll view.
@@ -79,10 +93,11 @@ nonisolated final class ReaderScrollOffset: @unchecked Sendable {
 nonisolated struct ReaderPagingBehavior: ScrollTargetBehavior {
     /// Width of one spread, which is the width of the scroll view's container.
     let pageWidth: CGFloat
-    /// The scroll view's live offset.
+    /// The scroll view's live offset, and whether this behavior is standing down.
     let offset: ReaderScrollOffset
 
     func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
+        guard !offset.isSuppressed else { return }
         target.rect.origin.x = ReaderPaging.settleTarget(
             origin: context.originalTarget.rect.minX,
             position: offset.value,

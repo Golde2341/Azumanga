@@ -62,6 +62,10 @@ struct ReaderView: View {
     @Environment(\.imagePipeline) private var images
 
     @State private var showChapterPicker = false
+    /// Whether the reading surface holds keyboard focus. The reader is opened to be
+    /// read, so it takes focus on its own rather than waiting for a click; without it
+    /// the first shortcut (F, a page key) is swallowed by the window and just beeps.
+    @FocusState private var isReaderFocused: Bool
     /// The window hosting the reader, used to drive full screen and measure traffic lights.
     @State private var window: NSWindow?
     /// Keeps native window-edge resizing on the current page/spread aspect.
@@ -103,6 +107,13 @@ struct ReaderView: View {
     /// The spread (or chapter break) on screen. Two-way bound to the horizontal scroll
     /// view, so a gesture reports where it landed and a keyboard turn can drive it back.
     @State private var spreadPosition: ReaderStreamItemID?
+    /// The spread to force back into view while the window frame changes. The
+    /// scroll-position binding alone can keep its value while the underlying
+    /// content offset lands on a neighbouring spread, so the horizontal reader
+    /// explicitly re-scrolls during and after an exclusive-full-screen animation.
+    @State private var horizontalScrollTarget: ReaderStreamItemID?
+    @State private var horizontalScrollRequest = 0
+    @State private var horizontalScrollPinTask: Task<Void, Never>?
     /// Vertical reader page tracking, kept out of observable state so scrolling never
     /// re-renders or moves the view.
     @State private var verticalScrollTracker = ReaderVerticalScrollTracker()
@@ -242,10 +253,16 @@ struct ReaderView: View {
             reconcileWindow(window)
         }
         .onChange(of: showsDisplayOptions) { _, isPresented in
-            if !isPresented { revealControls() }
+            if !isPresented {
+                revealControls()
+                isReaderFocused = true
+            }
         }
         .onChange(of: showChapterPicker) { _, isPresented in
-            if !isPresented { revealControls() }
+            if !isPresented {
+                revealControls()
+                isReaderFocused = true
+            }
         }
         .onHover { isInside in
             // Only the pointer arriving counts. Movement inside the reader deliberately
@@ -295,15 +312,21 @@ struct ReaderView: View {
             makeBorderless(newWindow)
             windowResizeDelegate.attach(to: newWindow)
             updateWindowResizeLock()
+            // Take key focus as soon as the reader is on screen. Without it the first
+            // key press goes to the window rather than the reading surface, so `F`
+            // and the page keys only work after a click.
+            newWindow.makeKeyAndOrderFront(nil)
             // The image task can finish before the window accessor has published the
             // window. Shape it as soon as both sides exist; pageAspect changes refine
             // the ratio when the current page's real proportions arrive.
             Task { @MainActor in
+                isReaderFocused = true
                 reconcileWindow(newWindow, resizingWindowShape: true)
             }
         }
         .navigationTitle(model.chapterLabel)
         .focusable()
+        .focused($isReaderFocused)
         .focusEffectDisabled()
         .onKeyPress(.leftArrow) { turnSpread(-1); return .handled }
         .onKeyPress(.rightArrow) { turnSpread(1); return .handled }
@@ -382,6 +405,9 @@ struct ReaderView: View {
             if newLayout == .vertical {
                 // Releasing the lock must not wait on full-screen bookkeeping; this
                 // only clears the ratio and any stuck size limit, it never resizes.
+                horizontalScrollPinTask?.cancel()
+                horizontalScrollPinTask = nil
+                horizontalScrollTarget = nil
                 applyWindowShape()
                 updateWindowResizeLock()
                 syncSectionsFromModel()
@@ -413,6 +439,17 @@ struct ReaderView: View {
         .onChange(of: model.isLoading) { _, isLoading in
             if !isLoading { scheduleIntroIfNeeded() }
         }
+        // Coming back to the reader window (from another app, or from the chapter
+        // sheet) hands it the keys again.
+        .task(id: window) {
+            guard let window else { return }
+            for await _ in NotificationCenter.default.notifications(
+                named: NSWindow.didBecomeKeyNotification,
+                object: window
+            ) {
+                isReaderFocused = true
+            }
+        }
         // Native full screen is tracked separately from the reader's own screen-filling
         // mode. Nothing is done to the window from `will…` until the transition has
         // unwound, except dropping any leftover exclusive-full-screen state: AppKit
@@ -437,6 +474,7 @@ struct ReaderView: View {
                 settings.readerFullscreen = true
                 isNativeFullScreen = true
                 isNativeFullScreenTransition = false
+                scrollOffset.isSuppressed = false
             }
         }
         .task(id: window) {
@@ -463,6 +501,7 @@ struct ReaderView: View {
                     try? await Task.sleep(for: .milliseconds(300))
                     guard generation == nativeFullScreenGeneration else { return }
                     isNativeFullScreenTransition = false
+                    scrollOffset.isSuppressed = false
                     reconcileWindow(window)
                     // Resizing into and out of native full screen can move a lazy
                     // horizontal scroll view by a page. Position callbacks are ignored
@@ -547,6 +586,10 @@ struct ReaderView: View {
             windowResizeDelegate.detach()
             episodeShapeTask?.cancel()
             verticalScrollTracker.applyTask?.cancel()
+            horizontalScrollPinTask?.cancel()
+            // The restore that would have released this is gone; do not leave the
+            // paging behavior stood down for the next reader.
+            scrollOffset.isSuppressed = false
             zoomApplyTask?.cancel()
             zoomPinTask?.cancel()
             zoomSettleTask?.cancel()
@@ -588,17 +631,96 @@ struct ReaderView: View {
         }
     }
 
-    /// Keeps pinning through the last layout pass, then releases the scroll view.
+    /// Re-asserts the anchor across the layout passes that follow the frame change,
+    /// then releases the scroll view.
+    ///
+    /// The window animates its frame, so SwiftUI rewrites the page layout on every
+    /// frame of the animation, and the lazy stack then realizes its pages at the new
+    /// size. A single correction can land before the document is tall enough to take
+    /// it, so the anchor is re-applied across those passes instead of trusted to one.
     private func finishWindowFramePositionPin() {
         guard resizeAnchor != nil else { return }
         resizeSettleTask?.cancel()
         resizeSettleTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled else { return }
             applyResizeAnchor()
+            for delay in Self.positionRestoreDelays {
+                try? await Task.sleep(for: .milliseconds(delay))
+                guard !Task.isCancelled else { return }
+                applyResizeAnchor()
+            }
             resizePinTask?.cancel()
             resizePinTask = nil
             resizeAnchor = nil
+            scrollOffset.isSuppressed = false
+        }
+    }
+
+    /// Waits, in milliseconds, between the passes that restore the reading position
+    /// after a frame change. Cumulative, so the last pass runs ~0.5s after the change.
+    private static let positionRestoreDelays = [60, 120, 160, 180]
+
+    /// Captures the spread that is actually on screen before the frame changes.
+    /// Horizontal paging has no scroll-position anchor as reliable as the vertical
+    /// reader's page-height math, so the spread is recorded here and the reader
+    /// returns to it once the frame change has settled. Nothing is done to the row
+    /// while the window animates; see the note in the body.
+    private func prepareHorizontalPositionForFullScreen() {
+        guard viewOptions.layout == .horizontal else { return }
+
+        // The model is the authority. It is what the reader has open, and a frame
+        // change never moves it. The scroll view's "visible" report is deliberately
+        // not consulted: during a transition, or straight after one, it can name a
+        // neighbour, and adopting it here would move the reader a page — which is
+        // what a rapid in/out cycle did, with no flicker to give it away.
+        horizontalScrollPinTask?.cancel()
+        horizontalScrollPinTask = nil
+        horizontalScrollTarget = currentHorizontalItemID
+        verticalScrollTracker.visibleHorizontalItemID = currentHorizontalItemID
+
+        // Take the row off SwiftUI's scroll-position tracking for the length of the
+        // animation. While an item is still identified, SwiftUI re-aligns it to the
+        // anchor on every frame of the size change, which walks the row toward a
+        // neighbour and back. With nothing identified there is nothing to re-align,
+        // so the offset is left where it is; the spread is put back when it settles.
+        spreadPosition = nil
+    }
+
+    /// Puts the spread back under the scroll-position binding once the width has
+    /// settled, so the row is centred on the spread the reader has open.
+    private func restoreHorizontalBinding() {
+        guard viewOptions.layout == .horizontal, spreadPosition == nil else { return }
+        spreadPosition = currentHorizontalItemID
+    }
+
+    /// Re-asserts the spread across the layout passes that follow the frame change,
+    /// then stops the pin.
+    ///
+    /// The horizontal row is lazy as well: its spreads are re-measured at the new
+    /// window width over several update cycles, and the scroll-position binding can
+    /// settle on a neighbour in between. Re-scrolling across those passes is what
+    /// lands the reader on the spread it was already showing.
+    private func finishHorizontalPositionForFullScreen() {
+        guard viewOptions.layout == .horizontal else { return }
+
+        horizontalScrollPinTask?.cancel()
+        horizontalScrollTarget = horizontalScrollTarget ?? currentHorizontalItemID
+
+        horizontalScrollPinTask = Task { @MainActor in
+            horizontalScrollTarget = horizontalScrollTarget ?? currentHorizontalItemID
+            horizontalScrollRequest &+= 1
+            for delay in Self.positionRestoreDelays {
+                try? await Task.sleep(for: .milliseconds(delay))
+                guard !Task.isCancelled else { return }
+                horizontalScrollTarget = horizontalScrollTarget ?? currentHorizontalItemID
+                horizontalScrollRequest &+= 1
+            }
+            // The row has settled. Make the reader's own record of what is on
+            // screen agree with the model again, so a later settling callback
+            // cannot take a stale neighbour as the reading position.
+            verticalScrollTracker.visibleHorizontalItemID = currentHorizontalItemID
+            // Only now let the paging behavior settle again.
+            scrollOffset.isSuppressed = false
+            horizontalScrollPinTask = nil
         }
     }
 
@@ -607,6 +729,9 @@ struct ReaderView: View {
     /// tracking is reset to the current page so the resize is never mistaken for a
     /// scroll gesture.
     private func settleFullScreenPosition() {
+        // The paging behavior is left standing down until the row has been restored;
+        // settling it against a half-restored offset would round onto a neighbour.
+        restoreHorizontalBinding()
         if viewOptions.layout == .vertical {
             verticalScrollTracker.applyTask?.cancel()
             verticalScrollTracker.applyTask = nil
@@ -614,16 +739,17 @@ struct ReaderView: View {
                 verticalScrollTracker.topPageID = id
                 verticalScrollTracker.lastAppliedPageID = id
             }
+            finishWindowFramePositionPin()
         } else {
-            syncHorizontalPosition(animated: false)
+            finishHorizontalPositionForFullScreen()
         }
-        finishWindowFramePositionPin()
     }
 
     /// Marks AppKit's native full screen transition as in flight. Window chrome is left
     /// alone until the matching `did…` notification has unwound.
     private func beginNativeFullScreenTransition() {
         suppressPageSync(for: 1.2)
+        scrollOffset.isSuppressed = true
         nativeFullScreenGeneration += 1
         isNativeFullScreenTransition = true
         windowResizeDelegate.isEnabled = false
@@ -641,11 +767,10 @@ struct ReaderView: View {
               let screen = window.screen ?? NSScreen.main
         else { return }
 
+        scrollOffset.isSuppressed = true
+        prepareHorizontalPositionForFullScreen()
         suppressPageSync(for: 0.8)
         beginWindowFramePositionPin()
-        if viewOptions.layout == .horizontal {
-            syncHorizontalPosition(animated: false)
-        }
         isFullScreenAnimating = true
         fullScreenState.generation &+= 1
         let generation = fullScreenState.generation
@@ -701,11 +826,10 @@ struct ReaderView: View {
     /// Puts the window back where it was and hands the menu bar and Dock back.
     private func exitReaderFullScreen(_ window: NSWindow) {
         guard isReaderFullScreen, !isFullScreenAnimating else { return }
+        scrollOffset.isSuppressed = true
+        prepareHorizontalPositionForFullScreen()
         suppressPageSync(for: 0.8)
         beginWindowFramePositionPin()
-        if viewOptions.layout == .horizontal {
-            syncHorizontalPosition(animated: false)
-        }
         isFullScreenAnimating = true
         fullScreenState.generation &+= 1
         let generation = fullScreenState.generation
@@ -768,6 +892,7 @@ struct ReaderView: View {
         isFullScreenAnimating = false
         isReaderFullScreen = false
         settings.readerFullscreen = false
+        scrollOffset.isSuppressed = false
 
         // Native full screen owns the frame now; stop pinning the old one.
         resizePinTask?.cancel()
@@ -775,6 +900,9 @@ struct ReaderView: View {
         resizeSettleTask?.cancel()
         resizeSettleTask = nil
         resizeAnchor = nil
+        horizontalScrollPinTask?.cancel()
+        horizontalScrollPinTask = nil
+        horizontalScrollTarget = nil
 
         if NSApp.isActive {
             NSApp.presentationOptions = savedPresentationOptions
@@ -1407,51 +1535,73 @@ struct ReaderView: View {
     private var horizontalReader: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            ScrollView(.horizontal) {
-                LazyHStack(spacing: 0) {
-                    ForEach(horizontalItems) { item in
-                        horizontalItemView(item, size: size)
-                            .frame(width: size.width, height: size.height)
-                            .id(item.id)
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal) {
+                    LazyHStack(spacing: 0) {
+                        ForEach(horizontalItems) { item in
+                            horizontalItemView(item, size: size)
+                                .frame(width: size.width, height: size.height)
+                                .id(item.id)
+                        }
+                    }
+                    .scrollTargetLayout()
+                }
+                // The behavior stands down while a full-screen frame change is in
+                // flight; see `ReaderScrollOffset.isSuppressed`.
+                .scrollTargetBehavior(
+                    ReaderPagingBehavior(pageWidth: size.width, offset: scrollOffset)
+                )
+                .scrollPosition(id: $spreadPosition, anchor: .center)
+                .scrollIndicators(.never)
+                // Right to left reverses the axis, which is exactly what manga wants.
+                .environment(\.layoutDirection, viewOptions.direction == .rightToLeft ? .rightToLeft : .leftToRight)
+                // Where the fingers let go is only knowable here, so it is passed to the
+                // behavior rather than left to the momentum the scroll view would project.
+                .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    geometry.contentOffset.x
+                } action: { _, offset in
+                    scrollOffset.value = offset
+                }
+                .onScrollPhaseChange { oldPhase, phase in
+                    verticalScrollTracker.isHorizontalScrolling = phase == .tracking
+                        || phase == .interacting
+                        || phase == .decelerating
+                    // Settle the model on exactly where the gesture stopped. The
+                    // scroll-position binding can lag behind the content offset, so
+                    // prefer the target the scroll view reports as visible.
+                    if oldPhase != .idle, phase == .idle {
+                        handleHorizontalPosition(
+                            verticalScrollTracker.visibleHorizontalItemID ?? spreadPosition
+                        )
                     }
                 }
-                .scrollTargetLayout()
-            }
-            .scrollTargetBehavior(ReaderPagingBehavior(pageWidth: size.width, offset: scrollOffset))
-            .scrollPosition(id: $spreadPosition, anchor: .center)
-            .scrollIndicators(.never)
-            // Right to left reverses the axis, which is exactly what manga wants.
-            .environment(\.layoutDirection, viewOptions.direction == .rightToLeft ? .rightToLeft : .leftToRight)
-            // Where the fingers let go is only knowable here, so it is passed to the
-            // behavior rather than left to the momentum the scroll view would project.
-            .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                geometry.contentOffset.x
-            } action: { _, offset in
-                scrollOffset.value = offset
-            }
-            .onScrollPhaseChange { oldPhase, phase in
-                verticalScrollTracker.isHorizontalScrolling = phase == .tracking
-                    || phase == .interacting
-                    || phase == .decelerating
-                // Settle the model on exactly where the gesture stopped. While the
-                // gesture is live the binding drives the model; nothing here moves
-                // the scroll view.
-                if oldPhase != .idle, phase == .idle {
-                    handleHorizontalPosition(spreadPosition)
+                .onScrollTargetVisibilityChange(
+                    idType: ReaderStreamItemID.self,
+                    threshold: 0.5
+                ) { visibleIDs in
+                    if let visible = visibleIDs.first {
+                        verticalScrollTracker.visibleHorizontalItemID = visible
+                    }
                 }
-            }
-            .onAppear {
-                verticalScrollTracker.isHorizontalScrolling = false
-                syncHorizontalPosition(animated: false)
-            }
-            .onChange(of: spreadPosition) { _, newValue in
-                handleHorizontalPosition(newValue)
-            }
-            .onChange(of: currentHorizontalItemID) { _, _ in
-                syncHorizontalPosition(animated: !isScrubbing && spreadPosition != nil)
-            }
-            .onChange(of: viewOptions.pageMode) { _, _ in
-                syncHorizontalPosition(animated: true)
+                .onAppear {
+                    verticalScrollTracker.isHorizontalScrolling = false
+                    syncHorizontalPosition(animated: false)
+                }
+                .onChange(of: spreadPosition) { _, newValue in
+                    handleHorizontalPosition(newValue)
+                }
+                .onChange(of: currentHorizontalItemID) { _, _ in
+                    syncHorizontalPosition(animated: !isScrubbing && spreadPosition != nil)
+                }
+                .onChange(of: viewOptions.pageMode) { _, _ in
+                    syncHorizontalPosition(animated: true)
+                }
+                .onChange(of: horizontalScrollRequest) { _, _ in
+                    guard let target = horizontalScrollTarget else { return }
+                    withAnimation(nil) {
+                        proxy.scrollTo(target, anchor: .center)
+                    }
+                }
             }
         }
     }
@@ -3062,6 +3212,10 @@ private final class ReaderVerticalScrollTracker {
     var isUserScrolling = false
     /// True while the horizontal pager is tracking the user's fingers.
     var isHorizontalScrolling = false
+    /// The horizontal target that is actually on screen, as reported by the scroll
+    /// view. `spreadPosition` is a binding and can lag behind during a paging
+    /// gesture; this is the reliable source for restoring a reading position.
+    var visibleHorizontalItemID: ReaderStreamItemID?
     /// True while the model is being moved across a chapter boundary by scrolling,
     /// so the resulting page change is not mistaken for an explicit jump.
     var isApplyingModelChange = false
