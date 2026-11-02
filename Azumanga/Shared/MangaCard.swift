@@ -38,12 +38,21 @@ struct MangaCard: View {
     let manga: Manga
     var isFavorite: Bool = false
     var progressLabel: String?
+    /// Adds a soft backdrop shadow behind the cover. Library cards use it; browse
+    /// results stay flat so the grid reads as a catalogue.
+    var showsCoverShadow: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             CoverImage(url: manga.coverURL)
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .shadow(
+                    color: showsCoverShadow ? .black.opacity(0.45) : .clear,
+                    radius: showsCoverShadow ? 10 : 0,
+                    x: 0,
+                    y: showsCoverShadow ? 6 : 0
+                )
                 .overlay(alignment: .topTrailing) {
                     if isFavorite {
                         Image(systemName: "heart.fill")

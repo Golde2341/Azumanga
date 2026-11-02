@@ -129,6 +129,8 @@ struct LibraryView: View {
                     items: visibleEntries.map(\.manga),
                     favoriteIds: favoriteKeys,
                     progressLabel: progressLabel,
+                    showsCoverShadow: true,
+                    columnSpacing: 20,
                     onOpen: { path.append($0) },
                     onForceTouch: continueReading
                 )

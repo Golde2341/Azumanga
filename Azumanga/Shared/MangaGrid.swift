@@ -7,6 +7,8 @@ struct MangaGrid: View {
     var favoriteIds: Set<String> = []
     var progressLabel: (Manga) -> String? = { _ in nil }
     var isLoadingMore: Bool = false
+    var showsCoverShadow: Bool = false
+    var columnSpacing: CGFloat = 16
     var onReachEnd: (() -> Void)?
     /// Opens the card's detail view. Supplying this also installs the Force Touch
     /// overlay, which takes over pointer clicks so it can tell a force click apart
@@ -16,7 +18,9 @@ struct MangaGrid: View {
     /// handled; returning `false` lets the regular click open the detail view.
     var onForceTouch: ((Manga) -> Bool)?
 
-    private let columns = [GridItem(.adaptive(minimum: 132, maximum: 190), spacing: 16)]
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: 132, maximum: 190), spacing: columnSpacing)]
+    }
 
     var body: some View {
         LazyVGrid(columns: columns, spacing: 18) {
@@ -25,7 +29,8 @@ struct MangaGrid: View {
                     MangaCard(
                         manga: manga,
                         isFavorite: favoriteIds.contains(manga.id),
-                        progressLabel: progressLabel(manga)
+                        progressLabel: progressLabel(manga),
+                        showsCoverShadow: showsCoverShadow
                     )
                 }
                 .buttonStyle(.plain)
