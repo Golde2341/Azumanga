@@ -68,10 +68,9 @@ nonisolated struct LocalChapterEntry: Codable, Sendable, Equatable, Identifiable
 nonisolated struct LocalLibraryStore: Sendable {
     let root: URL
 
+    /// Imported manga live in Documents/azumanga beside downloaded chapters.
     static var defaultRoot: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("Azumanga/LocalLibrary", isDirectory: true)
+        AppDirectories.documents("LocalLibrary")
     }
 
     /// Bumped whenever the page rasteriser changes, so pages unpacked by an older
@@ -331,6 +330,98 @@ nonisolated struct LocalLibraryStore: Sendable {
         try removeOtherCovers(mangaId: mangaId, keeping: name)
         try copyIntoLibrary(from: source, to: mangaDirectory(mangaId).appendingPathComponent(name))
         return name
+    }
+
+    /// Removes an import and everything it put on disk.
+    func deleteManga(id mangaId: String) {
+        try? FileManager.default.removeItem(at: mangaDirectory(mangaId))
+    }
+
+    /// Imports dropped files or folders straight into the library.
+    ///
+    /// A dropped folder becomes one manga whose chapters are the CBZ/PDF files inside
+    /// it; loose files are grouped into a single manga. Nothing is asked, so dropping
+    /// a batch is a one-step import.
+    func importDropped(_ urls: [URL]) throws -> [Manga] {
+        // Hold every drop's security scope for the whole import: the files are copied
+        // later, and a folder's children are only readable while its scope is held.
+        let scopes = urls.map { ($0, $0.startAccessingSecurityScopedResource()) }
+        defer {
+            for (url, active) in scopes where active {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        var mangas: [Manga] = []
+        var loose: [URL] = []
+
+        for url in urls {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                continue
+            }
+
+            if isDirectory.boolValue {
+                let files = Self.chapterFiles(in: url)
+                guard !files.isEmpty else { continue }
+                if let manga = try? createManga(
+                    title: url.lastPathComponent,
+                    description: nil,
+                    author: nil,
+                    artist: nil,
+                    genres: [],
+                    status: .unknown,
+                    cover: nil,
+                    files: files
+                ).manga {
+                    mangas.append(manga)
+                }
+            } else if Self.isChapterFile(url) {
+                loose.append(url)
+            }
+        }
+
+        if !loose.isEmpty {
+            let sorted = Self.naturalSorted(loose)
+            let parent = sorted.first?.deletingLastPathComponent().lastPathComponent ?? ""
+            let title = parent.isEmpty ? "Imported manga" : parent
+            if let manga = try? createManga(
+                title: title,
+                description: nil,
+                author: nil,
+                artist: nil,
+                genres: [],
+                status: .unknown,
+                cover: nil,
+                files: sorted
+            ).manga {
+                mangas.append(manga)
+            }
+        }
+
+        return mangas
+    }
+
+    static func isChapterFile(_ url: URL) -> Bool {
+        let fileExtension = url.pathExtension.lowercased()
+        return fileExtension == "cbz" || fileExtension == "pdf"
+    }
+
+    /// Every CBZ/PDF under a folder, in natural name order.
+    static func chapterFiles(in folder: URL) -> [URL] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: folder,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var files: [URL] = []
+        for case let url as URL in enumerator {
+            guard !url.pathComponents.contains("__MACOSX") else { continue }
+            guard isChapterFile(url) else { continue }
+            files.append(url)
+        }
+        return naturalSorted(files)
     }
 
     /// Points the metadata at a cover file that was just written.

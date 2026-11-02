@@ -30,6 +30,10 @@ nonisolated final class DiskImageCache: @unchecked Sendable {
         try? data.write(to: fileURL(for: key), options: .atomic)
     }
 
+    func remove(forKey key: String) {
+        try? FileManager.default.removeItem(at: fileURL(for: key))
+    }
+
     func removeAll() {
         try? FileManager.default.removeItem(at: directory)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

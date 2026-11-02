@@ -20,6 +20,37 @@ enum AppDataMigration {
             to: "Azumanga",
             fileManager: fileManager
         )
+
+        // Downloaded chapters and imported manga now live in Documents/azumanga.
+        moveIntoDocuments("Downloads", fileManager: fileManager)
+        moveIntoDocuments("LocalLibrary", fileManager: fileManager)
+    }
+
+    /// Moves a folder that an older build kept in Application Support into the
+    /// Documents folder the app uses now. Does nothing once the move has happened.
+    private static func moveIntoDocuments(_ name: String, fileManager: FileManager) {
+        guard let support = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first,
+              let documents = fileManager.urls(
+                  for: .documentDirectory,
+                  in: .userDomainMask
+              ).first
+        else { return }
+
+        let old = support.appendingPathComponent("Azumanga/\(name)", isDirectory: true)
+        let new = documents.appendingPathComponent("azumanga/\(name)", isDirectory: true)
+
+        guard fileManager.fileExists(atPath: old.path),
+              !fileManager.fileExists(atPath: new.path)
+        else { return }
+
+        try? fileManager.createDirectory(
+            at: new.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? fileManager.moveItem(at: old, to: new)
     }
 
     private static func migrate(

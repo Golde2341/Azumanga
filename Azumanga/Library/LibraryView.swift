@@ -81,7 +81,28 @@ struct LibraryView: View {
         .sheet(isPresented: $showingEditDetails) {
             ImportMangaSheet(services: services, library: library, editingMangaId: editingMangaId)
         }
+        .dropDestination(for: URL.self) { urls, _ in
+            importDropped(urls)
+            return true
+        }
         .task {
+            library.reload()
+        }
+    }
+
+    /// Dropping CBZ/PDF files or folders onto the Library imports them without a
+    /// sheet: a folder becomes one manga, loose files are grouped into one.
+    private func importDropped(_ urls: [URL]) {
+        let store = services.localLibrary
+        Task {
+            let mangas = await Task.detached {
+                (try? store.importDropped(urls)) ?? []
+            }.value
+
+            guard !mangas.isEmpty else { return }
+            for manga in mangas {
+                library.add(manga)
+            }
             library.reload()
         }
     }

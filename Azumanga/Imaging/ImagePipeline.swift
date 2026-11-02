@@ -125,6 +125,14 @@ actor ImagePipeline {
         memory.removeAll()
     }
 
+    /// Drops everything cached for one image, at every render size. Used when a
+    /// manga is deleted from the library, so its cover does not linger on disk.
+    func evict(url: URL) {
+        let key = DiskImageCache.key(for: url)
+        disk.remove(forKey: key)
+        memory.removeAll(withPrefix: key)
+    }
+
     func clearDisk() {
         disk.removeAll()
     }

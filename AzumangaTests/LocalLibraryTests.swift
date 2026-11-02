@@ -109,6 +109,57 @@ struct LocalLibraryTests {
         #expect(reloaded.map(\.number) == [1, 2])
     }
 
+    @Test("Dropping a folder imports one manga whose chapters are the files inside it")
+    func importDroppedFolder() throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let folder = root.appendingPathComponent("My Manga", isDirectory: true)
+        _ = try makeFile(named: "Ch 2.cbz", in: folder)
+        _ = try makeFile(named: "Ch 10.cbz", in: folder)
+        _ = try makeFile(named: "Ch 1.pdf", in: folder)
+        _ = try makeFile(named: "notes.txt", in: folder)
+
+        let store = LocalLibraryStore(
+            root: root.appendingPathComponent("library", isDirectory: true)
+        )
+        let mangas = try store.importDropped([folder])
+
+        #expect(mangas.count == 1)
+        #expect(mangas.first?.title == "My Manga")
+        // Only the CBZ/PDF files become chapters, in natural name order.
+        #expect(store.chapters(mangas[0].mangaId).map(\.title) == ["Ch 1", "Ch 2", "Ch 10"])
+    }
+
+    @Test("Deleting an import removes its files")
+    func deleteMangaRemovesFiles() throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let file = try makeFile(named: "Ch 1.cbz", in: source)
+
+        let store = LocalLibraryStore(
+            root: root.appendingPathComponent("library", isDirectory: true)
+        )
+        let created = try store.createManga(
+            title: "Test",
+            description: nil,
+            author: nil,
+            artist: nil,
+            genres: [],
+            status: .unknown,
+            cover: nil,
+            files: [file]
+        )
+
+        let directory = store.mangaDirectory(created.manga.mangaId)
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+
+        store.deleteManga(id: created.manga.mangaId)
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+    }
+
     // MARK: - PDF chapters
 
     /// A white page with a black square in its top-left corner. PDF space is y-up,

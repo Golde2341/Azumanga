@@ -23,6 +23,13 @@ struct MangaDetailView: View {
     @State private var chapterRowFrames: [String: CGRect] = [:]
     @State private var marqueeSelectionBase: Set<String>?
     @State private var showingEditDetails = false
+    /// Whether the pointer is over the "In Library" state, which reveals delete.
+    @State private var isHoveringLibraryState = false
+    /// A delete the user has asked for but not committed. Nothing is removed while
+    /// this is set — the manga stays in the library and the button offers Undo. The
+    /// delete only goes through when the user leaves this screen (back to the
+    /// library, switching section), closes the window, or quits.
+    @State private var pendingUndoManga: Manga?
 
     init(manga: Manga) {
         self.manga = manga
@@ -54,6 +61,19 @@ struct MangaDetailView: View {
         }
         .sheet(isPresented: $showingEditDetails) {
             ImportMangaSheet(services: services, library: library, editingMangaId: manga.mangaId)
+        }
+        .onDisappear {
+            // Going back to the library, switching section, or closing the window
+            // ends the undo opportunity.
+            commitPendingDelete()
+        }
+        .task {
+            // Quitting commits it too.
+            for await _ in NotificationCenter.default.notifications(
+                named: NSApplication.willTerminateNotification
+            ) {
+                commitPendingDelete()
+            }
         }
         .onChange(of: showingEditDetails) { _, isPresented in
             guard !isPresented else { return }
@@ -469,15 +489,28 @@ struct MangaDetailView: View {
                         .buttonStyle(.borderedProminent)
                     }
 
+                    // One button for the whole membership cycle. Every label is laid
+                    // out at once, so the button keeps its exact shape and the labels
+                    // cross-fade into one another: Add → In Library → Delete → Undo.
                     Button {
-                        model.toggleLibrary()
-                        library.reload()
+                        performLibraryAction()
                     } label: {
-                        Label(
-                            model.isInLibrary ? "In Library" : "Add to Library",
-                            systemImage: model.isInLibrary ? "checkmark.circle.fill" : "plus.circle"
-                        )
+                        ZStack {
+                            Label("Add to Library", systemImage: "plus.circle")
+                                .opacity(libraryButtonState == .add ? 1 : 0)
+                            Label("In Library", systemImage: "checkmark.circle.fill")
+                                .opacity(libraryButtonState == .inLibrary ? 1 : 0)
+                            Label("Delete", systemImage: "trash")
+                                .opacity(libraryButtonState == .delete ? 1 : 0)
+                            Label("Undo", systemImage: "arrow.uturn.backward")
+                                .opacity(libraryButtonState == .undo ? 1 : 0)
+                        }
+                        .animation(.easeInOut(duration: 0.14), value: libraryButtonState)
                     }
+                    .tint(libraryButtonState == .delete ? .red : nil)
+                    .accessibilityLabel(libraryButtonState.accessibilityLabel)
+                    .help(libraryButtonState.accessibilityLabel)
+                    .onHover { isHoveringLibraryState = $0 }
 
                     if let entry {
                         Button {
@@ -518,6 +551,77 @@ struct MangaDetailView: View {
 
     private var entry: LibraryEntry? {
         library.entry(for: manga)
+    }
+
+    // MARK: - Library membership
+
+    private enum LibraryButtonState {
+        case add
+        case inLibrary
+        case delete
+        case undo
+
+        var accessibilityLabel: String {
+            switch self {
+            case .add: "Add to Library"
+            case .inLibrary: "In Library"
+            case .delete: "Delete from Library"
+            case .undo: "Undo delete"
+            }
+        }
+    }
+
+    private var libraryButtonState: LibraryButtonState {
+        if pendingUndoManga != nil { return .undo }
+        guard model?.isInLibrary == true else { return .add }
+        return isHoveringLibraryState ? .delete : .inLibrary
+    }
+
+    private func performLibraryAction() {
+        switch libraryButtonState {
+        case .add:
+            model?.toggleLibrary()
+            library.reload()
+        case .inLibrary, .delete:
+            deleteFromLibrary()
+        case .undo:
+            undoDelete()
+        }
+    }
+
+    /// Asks to delete the manga. Nothing actually happens yet: the entry stays in
+    /// the library and the button turns into Undo, so the delete is only confirmed by
+    /// leaving this screen, closing the window, or quitting.
+    private func deleteFromLibrary() {
+        guard pendingUndoManga == nil else { return }
+        pendingUndoManga = manga
+    }
+
+    private func undoDelete() {
+        pendingUndoManga = nil
+    }
+
+    /// Confirms a pending delete: the library entry goes, then an import's files and
+    /// its cached cover. Called when the undo opportunity ends.
+    private func commitPendingDelete() {
+        guard let pending = pendingUndoManga else { return }
+        pendingUndoManga = nil
+
+        if let entry = library.entry(for: pending) {
+            library.remove(entry)
+        }
+        model?.isInLibrary = false
+
+        // The folder removal is synchronous so it still happens when the app is
+        // quitting; the cache eviction is best-effort.
+        if pending.sourceId == LocalLibrarySource.sourceId {
+            services.localLibrary.deleteManga(id: pending.mangaId)
+        }
+        if let cover = pending.coverURL {
+            Task { await services.images.evict(url: cover) }
+        }
+
+        library.reload()
     }
 
     @ToolbarContentBuilder

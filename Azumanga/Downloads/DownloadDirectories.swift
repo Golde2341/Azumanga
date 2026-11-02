@@ -34,10 +34,10 @@ nonisolated struct DownloadOutcome: Sendable, Equatable {
 nonisolated struct DownloadDirectories: Sendable {
     let root: URL
 
+    /// Downloaded chapters live in Documents/azumanga, beside imported manga, so the
+    /// user can find and manage them.
     static var defaultRoot: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("Azumanga/Downloads", isDirectory: true)
+        AppDirectories.documents("Downloads")
     }
 
     init(root: URL = DownloadDirectories.defaultRoot) {
