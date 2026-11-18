@@ -62,7 +62,7 @@ struct RootView: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .compatGlass(interactive: true, in: Capsule())
                 .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 3)
                 .padding(8)
 

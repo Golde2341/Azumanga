@@ -259,7 +259,7 @@ struct ReaderView: View {
         .ignoresSafeArea(.container, edges: .top)
         // In native full screen the window's toolbar only exists for the traffic
         // lights' spacing, so keep it out of the way until the pointer asks for it.
-        .windowToolbarFullScreenVisibility(.onHover)
+        .compatToolbarFullScreenVisibilityOnHover()
         // The traffic lights follow the controls, so a reader with the controls put
         // away has nothing on screen but the page.
         .onChange(of: controlsVisible) { _, _ in
@@ -1147,7 +1147,7 @@ struct ReaderView: View {
                 .onPreferenceChange(ReaderVerticalPageTopsKey.self) { tops in
                     trackVerticalPage(tops)
                 }
-                .onScrollPhaseChange { oldPhase, phase in
+                .compatScrollPhaseChange(scrollView: $verticalScrollView) { oldPhase, phase in
                     verticalScrollTracker.isUserScrolling = phase == .tracking
                         || phase == .interacting
                         || phase == .decelerating
@@ -1559,12 +1559,10 @@ struct ReaderView: View {
                 .environment(\.layoutDirection, viewOptions.direction == .rightToLeft ? .rightToLeft : .leftToRight)
                 // Where the fingers let go is only knowable here, so it is passed to the
                 // behavior rather than left to the momentum the scroll view would project.
-                .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                    geometry.contentOffset.x
-                } action: { _, offset in
+                .compatScrollOffsetChange(scrollView: $horizontalScrollView) { offset in
                     scrollOffset.value = offset
                 }
-                .onScrollPhaseChange { oldPhase, phase in
+                .compatScrollPhaseChange(scrollView: $horizontalScrollView) { oldPhase, phase in
                     // A real gesture takes the row back from a keyboard turn.
                     if phase == .tracking || phase == .interacting {
                         horizontalTurnTask?.cancel()
@@ -1584,10 +1582,7 @@ struct ReaderView: View {
                         )
                     }
                 }
-                .onScrollTargetVisibilityChange(
-                    idType: ReaderStreamItemID.self,
-                    threshold: 0.5
-                ) { visibleIDs in
+                .compatTargetVisibilityChange(threshold: 0.5) { visibleIDs in
                     if let visible = visibleIDs.first {
                         verticalScrollTracker.visibleHorizontalItemID = visible
                     }
@@ -2294,7 +2289,7 @@ struct ReaderView: View {
         VStack {
             Spacer()
             if !model.pages.isEmpty {
-                GlassEffectContainer(spacing: 10) {
+                CompatGlassContainer(spacing: 10) {
                     HStack(spacing: 10) {
                         pageStepButton(
                             direction: -1,
@@ -2312,7 +2307,7 @@ struct ReaderView: View {
                         .frame(width: 260)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 8)
-                        .glassEffect(.regular, in: Capsule())
+                        .compatGlass(in: Capsule())
 
                         pageStepButton(
                             direction: 1,
@@ -2344,7 +2339,7 @@ struct ReaderView: View {
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
-        .glassEffect(.regular, in: Circle())
+        .compatGlass(in: Circle())
         .help(direction < 0 ? "Previous page" : "Next page")
     }
 
@@ -2429,7 +2424,7 @@ struct ReaderView: View {
     /// own, so hiding and showing it pushed the page up and down underneath it; drawn over
     /// the page means the controls can come and go without the reading position moving.
     private var controlBar: some View {
-        GlassEffectContainer(spacing: 12) {
+        compatGlassContainer(spacing: 12) {
             HStack(spacing: 12) {
                 glassGroup {
                     closeControl
@@ -2458,10 +2453,14 @@ struct ReaderView: View {
         // Measure the bar itself, before the top padding that positions it. Including
         // that padding here would feed its own offset back into the height calculation
         // and leave the bar a few pixels above the traffic-light centre line.
-        .onGeometryChange(for: CGFloat.self) { bar in
-            bar.size.height
-        } action: { height in
-            controlBarHeight = height
+        .background {
+            GeometryReader { bar in
+                Color.clear
+                    .onAppear { controlBarHeight = bar.size.height }
+                    .onChange(of: bar.size.height) { _, height in
+                        controlBarHeight = height
+                    }
+            }
         }
         .padding(.top, controlBarTopPadding)
         // A soft shadow lifts the floating bar off the page while the controls are up;
@@ -2496,6 +2495,19 @@ struct ReaderView: View {
         return screen.safeAreaInsets.top
     }
 
+    /// Groups controls onto shared glass on macOS 26+, plain layout before that.
+    @ViewBuilder
+    private func compatGlassContainer<Content: View>(
+        spacing: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: spacing, content: content)
+        } else {
+            content()
+        }
+    }
+
     /// Puts a run of controls on one piece of glass, the way a toolbar groups them.
     private func glassGroup<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         HStack(spacing: 10) {
@@ -2506,7 +2518,7 @@ struct ReaderView: View {
         .buttonStyle(.borderless)
         .padding(.horizontal, 11)
         .padding(.vertical, 6)
-        .glassEffect()
+        .compatGlass()
     }
 
     private var closeControl: some View {
@@ -2560,7 +2572,7 @@ struct ReaderView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
-        .glassEffect()
+        .compatGlass()
         // The camera housing sits over the middle of the screen and only in full
         // screen, native or the reader's own; the rest of the bar is beside it, so the
         // title alone steps down out of the notch. Displays without one are left alone.
@@ -3402,11 +3414,28 @@ private struct ReaderResizeGrip: NSViewRepresentable {
         }
 
         override func resetCursorRects() {
-            addCursorRect(
-                bounds,
-                cursor: .frameResize(position: .bottomRight, directions: .all)
-            )
+            if #available(macOS 15.0, *) {
+                addCursorRect(
+                    bounds,
+                    cursor: .frameResize(position: .bottomRight, directions: .all)
+                )
+            } else {
+                // No corner-specific resize cursor before macOS 15, so the grip draws
+                // its own diagonal cursor from the same symbol it shows on screen.
+                addCursorRect(bounds, cursor: Self.legacyResizeCursor)
+            }
         }
+
+        /// A diagonal resize arrow, for macOS 14 where `frameResize` does not exist.
+        private static let legacyResizeCursor: NSCursor = {
+            let configuration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+            let image = NSImage(
+                systemSymbolName: "arrow.up.left.and.arrow.down.right",
+                accessibilityDescription: "Resize"
+            )?.withSymbolConfiguration(configuration)
+            let size = image?.size ?? NSSize(width: 14, height: 14)
+            return NSCursor(image: image ?? NSImage(size: size), hotSpot: NSPoint(x: size.width / 2, y: size.height / 2))
+        }()
 
         override func mouseDown(with event: NSEvent) {
             startFrame = targetWindow?.frame
@@ -3576,14 +3605,14 @@ private struct ReaderVerticalPageTopsKey: PreferenceKey {
 /// Identity of a page in the reading stream. Chapters are identified by their stable
 /// id rather than their position in the chapter list, so a chapter list that arrives
 /// after the reader opens can never renumber pages that are already on screen.
-private struct ReaderPageID: Hashable {
+struct ReaderPageID: Hashable {
     let chapterId: String
     let pageIndex: Int
 }
 
 /// Identity of any view in the stream: a page/spread or the break after a chapter.
 /// Used by the horizontal scroll position as well as the vertical page tracking.
-private enum ReaderStreamItemID: Hashable {
+enum ReaderStreamItemID: Hashable {
     case page(ReaderPageID)
     case chapterBreak(String)
 }
@@ -3668,13 +3697,22 @@ private struct WindowAccessor: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
-        Task { @MainActor in window = view.window }
+        Task { @MainActor in
+            window = view.window
+            view.window?.isRestorable = false
+        }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         Task { @MainActor in
-            if window !== nsView.window { window = nsView.window }
+            if window !== nsView.window {
+                window = nsView.window
+            }
+            // Reading is a session, not a document: the reader must never reopen at
+            // launch. `restorationBehavior(.disabled)` only exists from macOS 15, and
+            // this window belongs to the reader either way.
+            nsView.window?.isRestorable = false
         }
     }
 }

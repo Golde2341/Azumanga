@@ -47,7 +47,6 @@ struct AzumangaApp: App {
         // Reading is a session, not a document: reopening it at launch would drop the
         // reader back into whichever chapter was last open, which is not where anyone
         // wants to start. Opening a chapter is always an explicit act.
-        .restorationBehavior(.disabled)
         .modelContainer(app.services.container)
     }
 }

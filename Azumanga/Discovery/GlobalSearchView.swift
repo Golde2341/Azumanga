@@ -88,7 +88,7 @@ struct GlobalSearchView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .glassEffect(.regular, in: Capsule())
+        .compatGlass(in: Capsule())
         .shadow(color: .black.opacity(0.25), radius: 8, x: 0, y: 3)
         .padding(.horizontal, 18)
         .padding(.bottom, 12)

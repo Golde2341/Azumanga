@@ -7,7 +7,7 @@ Azumanga is a **client only**. It does not host, mirror, upload or distribute
 manga. It connects to third-party providers and displays content made available
 by those services.
 
-![macOS 27+](https://img.shields.io/badge/macOS-27%2B-black?logo=apple)
+![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Swift 5](https://img.shields.io/badge/Swift-5-orange?logo=swift)
 ![Kotlin/JVM 17](https://img.shields.io/badge/Kotlin%2FJVM-17-7F52FF?logo=kotlin)
 
@@ -32,8 +32,8 @@ by those services.
 
 | Requirement | Version |
 | --- | --- |
-| macOS | 27 or later |
-| Xcode | Current Xcode with the macOS 27 SDK |
+| macOS | 14 (Sonoma) or later |
+| Xcode | 26 or later, for Swift 6.2 and a current macOS SDK |
 | Swift | 5 |
 | JDK | 17, for building and running the Kotatsu parser host |
 | Gradle | Not required separately; use `ParserHost/gradlew` |
