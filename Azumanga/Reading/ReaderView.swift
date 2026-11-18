@@ -133,6 +133,18 @@ struct ReaderView: View {
     /// Whether the reader's own controls are on screen. They stay out of the way while
     /// reading and come back when the pointer arrives or the page is clicked.
     @State private var controlsVisible = true
+    /// The horizontal row's backing scroll view, found through `ScrollViewAccessor`.
+    /// A keyboard turn moves this view directly, so both pages slide together.
+    @State private var horizontalScrollView: NSScrollView?
+    @State private var horizontalPageWidth: CGFloat = 0
+    /// True while a keyboard turn is tweening the row. Scroll tracking and the
+    /// scroll-position binding stand down so SwiftUI cannot snap to the target
+    /// before the animation has played.
+    @State private var isAnimatingHorizontalTurn = false
+    @State private var horizontalTurnTask: Task<Void, Never>?
+    /// The offset an in-flight turn is heading to, so a second key press continues
+    /// from there rather than from the half-way point.
+    @State private var horizontalTurnEndX: CGFloat?
     /// Bumped every time the controls are called for. Drives the countdown that puts them
     /// away again, so SwiftUI owns the timing rather than a task held in state.
     @State private var revealTick = 0
@@ -332,8 +344,8 @@ struct ReaderView: View {
         .focusable()
         .focused($isReaderFocused)
         .focusEffectDisabled()
-        .onKeyPress(.leftArrow) { turnSpread(-1); return .handled }
-        .onKeyPress(.rightArrow) { turnSpread(1); return .handled }
+        .onKeyPress(.leftArrow) { turnSpread(horizontalArrowStep(-1)); return .handled }
+        .onKeyPress(.rightArrow) { turnSpread(horizontalArrowStep(1)); return .handled }
         .onKeyPress(.upArrow) { turnSpread(-1); return .handled }
         .onKeyPress(.downArrow) { turnSpread(1); return .handled }
         .onKeyPress(.space) { turnSpread(1); return .handled }
@@ -593,6 +605,7 @@ struct ReaderView: View {
             verticalShapeTask?.cancel()
             verticalScrollTracker.applyTask?.cancel()
             horizontalScrollPinTask?.cancel()
+            horizontalTurnTask?.cancel()
             // The restore that would have released this is gone; do not leave the
             // paging behavior stood down for the next reader.
             scrollOffset.isSuppressed = false
@@ -1530,6 +1543,7 @@ struct ReaderView: View {
                             horizontalItemView(item, size: size)
                                 .frame(width: size.width, height: size.height)
                                 .id(item.id)
+                                .background(ScrollViewAccessor(scrollView: $horizontalScrollView))
                         }
                     }
                     .scrollTargetLayout()
@@ -1551,6 +1565,13 @@ struct ReaderView: View {
                     scrollOffset.value = offset
                 }
                 .onScrollPhaseChange { oldPhase, phase in
+                    // A real gesture takes the row back from a keyboard turn.
+                    if phase == .tracking || phase == .interacting {
+                        horizontalTurnTask?.cancel()
+                        horizontalTurnTask = nil
+                        isAnimatingHorizontalTurn = false
+                        horizontalTurnEndX = nil
+                    }
                     verticalScrollTracker.isHorizontalScrolling = phase == .tracking
                         || phase == .interacting
                         || phase == .decelerating
@@ -1590,6 +1611,10 @@ struct ReaderView: View {
                         proxy.scrollTo(target, anchor: .center)
                     }
                 }
+            }
+            .onAppear { horizontalPageWidth = size.width }
+            .onChange(of: size.width) { _, newWidth in
+                horizontalPageWidth = newWidth
             }
         }
     }
@@ -1642,6 +1667,7 @@ struct ReaderView: View {
             }
         } else {
             spreadView(item.pages, size: size)
+                .background(viewOptions.background.color(warmedBy: viewOptions.warmth))
         }
     }
 
@@ -1667,6 +1693,7 @@ struct ReaderView: View {
 
     private func syncHorizontalPosition(animated: Bool) {
         guard !verticalScrollTracker.isHorizontalScrolling,
+              !isAnimatingHorizontalTurn,
               let id = currentHorizontalItemID,
               id != spreadPosition
         else { return }
@@ -1741,9 +1768,24 @@ struct ReaderView: View {
         return last.contains { $0.index == model.currentIndex }
     }
 
+    /// The reading step for a left or right arrow.
+    ///
+    /// With "Arrow keys follow scroll direction" on, the key matches the way the
+    /// row moves rather than the reading order: in right-to-left manga the left
+    /// arrow advances and the right arrow goes back. Vertical reading keeps its
+    /// own up/down mapping, which already follows the scroll.
+    private func horizontalArrowStep(_ arrow: Int) -> Int {
+        guard settings.keysFollowScrollDirection,
+              viewOptions.layout == .horizontal,
+              viewOptions.direction == .rightToLeft
+        else { return arrow }
+        return -arrow
+    }
+
     /// Deliberate page turn: one spread, which is one page in single-page mode and a
     /// facing pair in double-page mode.
     private func turnSpread(_ direction: Int) {
+        revealControls()
         guard !isNativeFullScreenTransition,
               !isFullScreenAnimating,
               !isPageSyncSuppressed
@@ -1753,8 +1795,8 @@ struct ReaderView: View {
             return
         }
 
-        // A reading-order step, which right to left reverses.
-        let step = viewOptions.direction == .rightToLeft ? -direction : direction
+        // The row is in reading order even when laid out right-to-left.
+        let step = direction
         let items = horizontalItems
         let start = items.firstIndex { $0.id == spreadPosition }
             ?? items.firstIndex { $0.id == currentHorizontalItemID }
@@ -1763,17 +1805,118 @@ struct ReaderView: View {
         var index = start + step
         while items.indices.contains(index) {
             if !items[index].isBreak {
-                withAnimation(ReaderView.pageTurnAnimation) {
-                    spreadPosition = items[index].id
-                }
+                turnHorizontalRow(from: start, to: index, target: items[index].id)
                 return
             }
             index += step
         }
 
-        // At the end of the loaded stream, load the adjacent chapter. The step
-        // already accounts for right-to-left, so use it rather than the arrow.
+        // At the end of the loaded stream, load the adjacent chapter.
         step > 0 ? model.nextPage() : model.previousPage()
+    }
+
+    /// Moves the horizontal row itself one spread, with an ease-in-out curve.
+    ///
+    /// The row is the only layer that holds the real pages, so tweening its offset
+    /// makes the outgoing and incoming pages slide together — no re-drawn page, no
+    /// blank frame. The model (and with it the page indicator) is updated at once;
+    /// the scroll-position binding is released for the length of the tween so
+    /// SwiftUI cannot snap to the destination before the animation has played.
+    private func turnHorizontalRow(
+        from startIndex: Int,
+        to targetIndex: Int,
+        target: ReaderStreamItemID
+    ) {
+        horizontalTurnTask?.cancel()
+
+        // Read the row's offset before any state changes, so the tween always starts
+        // from the frame the reader is actually looking at.
+        let startX = horizontalScrollView?.contentView.bounds.origin.x
+
+        // Update the page number/slider immediately, while the page is still moving.
+        isAnimatingHorizontalTurn = true
+        handleHorizontalPosition(target)
+        spreadPosition = nil
+        verticalScrollTracker.visibleHorizontalItemID = target
+
+        let delta = CGFloat(targetIndex - startIndex)
+        let sign: CGFloat = viewOptions.direction == .rightToLeft ? -1 : 1
+
+        horizontalTurnTask = Task { @MainActor in
+            guard let startX,
+                  horizontalPageWidth > 0,
+                  let scrollView = horizontalScrollView
+            else {
+                finishHorizontalTurn(target)
+                return
+            }
+
+            let clipView = scrollView.contentView
+            let currentX = startX
+            // A second key press may arrive mid-tween; continue from where the
+            // first one was heading so the pages keep moving in one direction.
+            let baseX = horizontalTurnEndX ?? currentX
+            let rawTargetX = baseX + delta * horizontalPageWidth * sign
+            let maxX = max(
+                0,
+                (scrollView.documentView?.frame.width ?? 0) - clipView.bounds.width
+            )
+            let targetX = min(max(rawTargetX, 0), maxX)
+            horizontalTurnEndX = targetX
+
+            let distance = targetX - currentX
+            guard abs(distance) >= 0.5 else {
+                finishHorizontalTurn(target)
+                return
+            }
+
+            // Drive the curve from the clock, not from the number of sleeps, so a
+            // late frame cannot stretch or flatten the easing. The updates are
+            // faster than the display refreshes, so the motion stays smooth.
+            let startTime = Date()
+            let duration: TimeInterval = 0.36
+            while true {
+                guard !Task.isCancelled else { return }
+                let t = min(1, Date().timeIntervalSince(startTime) / duration)
+                let eased = Self.easeInOut(CGFloat(t))
+                clipView.scroll(
+                    to: NSPoint(
+                        x: currentX + distance * eased,
+                        y: clipView.bounds.origin.y
+                    )
+                )
+                scrollView.reflectScrolledClipView(clipView)
+                if t >= 1 { break }
+                try? await Task.sleep(for: .milliseconds(8))
+            }
+            guard !Task.isCancelled else { return }
+
+            clipView.scroll(
+                to: NSPoint(x: targetX, y: clipView.bounds.origin.y)
+            )
+            scrollView.reflectScrolledClipView(clipView)
+            finishHorizontalTurn(target)
+        }
+    }
+
+    /// Hands the row back to the scroll-position binding once the tween has landed.
+    private func finishHorizontalTurn(_ target: ReaderStreamItemID) {
+        isAnimatingHorizontalTurn = false
+        horizontalTurnEndX = nil
+        horizontalTurnTask = nil
+        spreadPosition = target
+        verticalScrollTracker.visibleHorizontalItemID = target
+        if let scrollView = horizontalScrollView {
+            scrollOffset.value = scrollView.contentView.bounds.origin.x
+        }
+    }
+
+    /// Ease-in-out for a page turn: very little movement at either end and a fast
+    /// middle, with no visible corner where the acceleration changes.
+    private static func easeInOut(_ t: CGFloat) -> CGFloat {
+        let x = min(max(t, 0), 1)
+        // Smootherstep: 6x^5 - 15x^4 + 10x^3.
+        return x * x * x * (x * (x * 6 - 15) + 10)
     }
 
     /// A keyboard page turn in the vertical stream. Inside a chapter this is an
@@ -3498,14 +3641,21 @@ private struct ScrollViewAccessor: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
-        Task { @MainActor in scrollView = view.enclosingScrollView }
+        Task { @MainActor in
+            // A detached item reports no scroll view; never let it clear a good one.
+            if let found = view.enclosingScrollView, scrollView !== found {
+                scrollView = found
+            }
+        }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         Task { @MainActor in
-            if scrollView !== nsView.enclosingScrollView {
-                scrollView = nsView.enclosingScrollView
+            // Ignore a detached item, which has no enclosing scroll view: taking
+            // that as the answer would leave the reader with no row to animate.
+            if let found = nsView.enclosingScrollView, scrollView !== found {
+                scrollView = found
             }
         }
     }

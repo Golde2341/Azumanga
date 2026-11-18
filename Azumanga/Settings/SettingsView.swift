@@ -128,6 +128,13 @@ private struct ReadingSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Reading Controls") {
+                Toggle("Arrow keys follow scroll direction", isOn: $settings.keysFollowScrollDirection)
+                Text("When reading right to left, the left arrow goes forward and the right arrow goes back. Left-to-right manga is unchanged.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Performance") {
                 Stepper("Prefetch \(settings.prefetchDistance) page\(settings.prefetchDistance == 1 ? "" : "s") ahead", value: $settings.prefetchDistance, in: 0...10)
             }

@@ -18,6 +18,7 @@ final class SettingsStore {
         case prefetchDistance
         case doublePageFirstPageAlone
         case readerFullscreen
+        case keysFollowScrollDirection
     }
 
     @ObservationIgnored private let defaults: UserDefaults
@@ -77,6 +78,18 @@ final class SettingsStore {
         didSet { defaults.set(readerFullscreen, forKey: Key.readerFullscreen.rawValue) }
     }
 
+    /// Makes the left and right arrows follow the row's physical scroll direction.
+    /// In right-to-left manga that means the left arrow advances and the right one
+    /// goes back, matching the way the pages move.
+    var keysFollowScrollDirection: Bool {
+        didSet {
+            defaults.set(
+                keysFollowScrollDirection,
+                forKey: Key.keysFollowScrollDirection.rawValue
+            )
+        }
+    }
+
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.layout = ReaderLayoutKind(rawValue: defaults.string(forKey: Key.layout.rawValue) ?? "") ?? .vertical
@@ -89,6 +102,7 @@ final class SettingsStore {
         self.prefetchDistance = defaults.object(forKey: Key.prefetchDistance.rawValue) as? Int ?? 3
         self.doublePageFirstPageAlone = defaults.object(forKey: Key.doublePageFirstPageAlone.rawValue) as? Bool ?? true
         self.readerFullscreen = defaults.object(forKey: Key.readerFullscreen.rawValue) as? Bool ?? false
+        self.keysFollowScrollDirection = defaults.object(forKey: Key.keysFollowScrollDirection.rawValue) as? Bool ?? true
 
         let ratings = defaults.stringArray(forKey: Key.contentRatings.rawValue)?
             .compactMap(ContentRating.init(rawValue:))
