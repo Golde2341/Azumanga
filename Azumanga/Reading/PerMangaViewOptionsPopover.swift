@@ -13,19 +13,15 @@ struct PerMangaViewOptionsPopover: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 18) {
                 header
                 presets
+                viewSection
+                backgroundSection
+                warmthSection
+                sessionSection
+                chapterSection
                 Divider()
-                viewOptions
-                Divider()
-                backgroundOptions
-                Divider()
-                warmthOptions
-                Divider()
-                sessionActions
-                Divider()
-                chapterActions
                 resetButton
             }
             .padding(16)
@@ -34,31 +30,100 @@ struct PerMangaViewOptionsPopover: View {
         .frame(maxHeight: 620)
     }
 
+    private struct OptionSectionHeader: View {
+        let title: String
+        let systemImage: String
+        var tint: Color = .secondary
+
+        var body: some View {
+            HStack(spacing: 7) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 16, alignment: .center)
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+            }
+        }
+    }
+
+    private struct ViewOptionRow<Control: View>: View {
+        let title: String
+        let systemImage: String
+        private let control: Control
+
+        init(title: String, systemImage: String, @ViewBuilder control: () -> Control) {
+            self.title = title
+            self.systemImage = systemImage
+            self.control = control()
+        }
+
+        var body: some View {
+            HStack(spacing: 9) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 17, alignment: .center)
+                Text(title)
+                    .font(.callout)
+                Spacer(minLength: 6)
+                control
+            }
+            .frame(minHeight: 22)
+        }
+    }
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("Per Manga View Options")
-                    .font(.headline)
+            HStack(spacing: 10) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 32, height: 32)
+                    .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 9))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 9)
+                            .strokeBorder(Color.white.opacity(0.2), lineWidth: 1)
+                    }
+                    .shadow(color: Color.accentColor.opacity(0.35), radius: 4, y: 1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("View Options")
+                        .font(.headline)
+                    Text(mangaTitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(mangaTitle)
+                }
                 Spacer(minLength: 0)
                 Text(options.usesCustomOptions ? "Custom" : "Using defaults")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(options.usesCustomOptions ? Color.accentColor : Color.secondary)
-                    .padding(.horizontal, 7)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(options.usesCustomOptions ? Color.white : Color.secondary)
+                    .padding(.horizontal, 8)
                     .padding(.vertical, 3)
-                    .background(
-                        (options.usesCustomOptions ? Color.accentColor : Color.secondary)
-                            .opacity(0.12),
-                        in: Capsule()
-                    )
+                    .background {
+                        Capsule()
+                            .fill(
+                                options.usesCustomOptions
+                                    ? Color.accentColor
+                                    : Color.secondary.opacity(0.16)
+                            )
+                    }
+                    .overlay {
+                        Capsule()
+                            .strokeBorder(
+                                options.usesCustomOptions
+                                    ? Color.white.opacity(0.25)
+                                    : Color.secondary.opacity(0.3),
+                                lineWidth: 1
+                            )
+                    }
             }
 
-            Text(mangaTitle)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
             Text("Changes here apply only to this manga.")
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.tertiary)
         }
     }
@@ -80,12 +145,12 @@ struct PerMangaViewOptionsPopover: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 5) {
                     Image(systemName: preset.layout == .vertical ? "rectangle.portrait" : "book")
-                        .font(.caption)
+                        .font(.system(size: 12, weight: .medium))
                     Text(preset.displayName)
                         .font(.subheadline.weight(.semibold))
                 }
                 Text(preset.layout == .vertical ? "Vertical · Single page" : "Horizontal · Facing pairs")
-                    .font(.caption2)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -107,12 +172,11 @@ struct PerMangaViewOptionsPopover: View {
         .buttonStyle(.plain)
     }
 
-    private var viewOptions: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("View")
-                .font(.subheadline.weight(.semibold))
+    private var viewSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            OptionSectionHeader(title: "View", systemImage: "eye")
 
-            LabeledContent("Layout") {
+            ViewOptionRow(title: "Layout", systemImage: "rectangle.split.2x1") {
                 Picker("Layout", selection: $options.layout) {
                     ForEach(ReaderLayoutKind.allCases) { kind in
                         Text(kind.displayName).tag(kind)
@@ -122,7 +186,7 @@ struct PerMangaViewOptionsPopover: View {
                 .pickerStyle(.menu)
             }
 
-            LabeledContent("Direction") {
+            ViewOptionRow(title: "Direction", systemImage: "arrow.left.arrow.right") {
                 Picker("Direction", selection: $options.direction) {
                     ForEach(ReadingDirection.allCases) { direction in
                         Text(direction.displayName).tag(direction)
@@ -132,7 +196,7 @@ struct PerMangaViewOptionsPopover: View {
                 .pickerStyle(.menu)
             }
 
-            LabeledContent("Pages") {
+            ViewOptionRow(title: "Pages", systemImage: "rectangle.on.rectangle") {
                 Picker("Pages", selection: $options.pageMode) {
                     ForEach(PageMode.allCases) { mode in
                         Text(mode.displayName).tag(mode)
@@ -142,7 +206,7 @@ struct PerMangaViewOptionsPopover: View {
                 .pickerStyle(.menu)
             }
 
-            LabeledContent("Fit") {
+            ViewOptionRow(title: "Fit", systemImage: "aspectratio") {
                 Picker("Fit", selection: $options.fitMode) {
                     ForEach(PageFitMode.allCases) { mode in
                         Text(mode.displayName).tag(mode)
@@ -154,25 +218,20 @@ struct PerMangaViewOptionsPopover: View {
         }
     }
 
-    private var backgroundOptions: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Background")
-                .font(.subheadline.weight(.semibold))
-
+    private var backgroundSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            OptionSectionHeader(title: "Background", systemImage: "paintpalette")
             BackgroundSwatches(selection: $options.background)
         }
     }
 
-    private var warmthOptions: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Warmth")
-                    .font(.subheadline.weight(.semibold))
-
-                Spacer(minLength: 0)
-
+    private var warmthSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                OptionSectionHeader(title: "Warmth", systemImage: "sun.max", tint: .orange)
+                Spacer()
                 Text(options.warmth > 0.001 ? "\(Int((options.warmth * 100).rounded()))%" : "Off")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
 
@@ -180,6 +239,7 @@ struct PerMangaViewOptionsPopover: View {
                 Text("Warmth")
             }
             .labelsHidden()
+            .tint(.orange)
             .accessibilityValue(
                 options.warmth > 0.001
                     ? "\(Int((options.warmth * 100).rounded())) percent"
@@ -188,46 +248,60 @@ struct PerMangaViewOptionsPopover: View {
         }
     }
 
-    private var sessionActions: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Session")
-                .font(.subheadline.weight(.semibold))
+    private var sessionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            OptionSectionHeader(title: "Session", systemImage: "magnifyingglass")
 
             HStack(spacing: 8) {
-                Button("Zoom In", action: onZoomIn)
-                Button("Zoom Out", action: onZoomOut)
-                Button("Reset Zoom", action: onResetZoom)
+                actionButton("Zoom In", systemImage: "plus.magnifyingglass", action: onZoomIn)
+                actionButton("Zoom Out", systemImage: "minus.magnifyingglass", action: onZoomOut)
+                actionButton("Reset", systemImage: "arrow.counterclockwise", action: onResetZoom)
             }
-            .controlSize(.small)
             .disabled(options.layout != .vertical)
 
             if options.layout != .vertical {
                 Text("Zoom is available in Webtoon mode.")
-                    .font(.caption2)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
     }
 
-    private var chapterActions: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Chapter")
-                .font(.subheadline.weight(.semibold))
+    private func actionButton(
+        _ title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.callout)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+    }
+
+    private var chapterSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            OptionSectionHeader(title: "Chapter", systemImage: "bookmark")
 
             HStack(spacing: 8) {
-                Button("Mark Read", action: onMarkRead)
-                Button("Mark Unread", action: onMarkUnread)
+                actionButton("Mark Read", systemImage: "checkmark.circle", action: onMarkRead)
+                actionButton("Mark Unread", systemImage: "circle", action: onMarkUnread)
             }
-            .controlSize(.small)
         }
     }
 
     private var resetButton: some View {
-        Button("Reset to Default View", role: .destructive) {
+        Button(role: .destructive) {
             options.resetToDefaults()
+        } label: {
+            Label("Reset to Default View", systemImage: "arrow.counterclockwise")
+                .font(.callout)
+                .frame(maxWidth: .infinity)
         }
-        .controlSize(.small)
+        .buttonStyle(.bordered)
         .disabled(!options.usesCustomOptions)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
