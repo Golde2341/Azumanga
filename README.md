@@ -13,6 +13,14 @@ by those services.
 
 ---
 
+## Screenshots
+
+| Browse | Manga details | Reader |
+| --- | --- | --- |
+| ![Browse view](mockups/screenshot_1.5x_postspark_2026-11-26_01-06-49.png) | ![Manga details view](mockups/screenshot_1.5x_postspark_2026-11-26_01-08-06.png) | ![Reader view](mockups/screenshot_1.5x_postspark_2026-11-26_01-10-14.png) |
+
+---
+
 ## Features
 
 - Native **MangaDex** provider.
